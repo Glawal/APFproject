@@ -10,6 +10,20 @@ from io import StringIO
 import random
 import re
 import time
+import cProfile
+import pstats
+import osqp
+#from scipy import sparse
+from scipy.spatial.distance import cdist
+from autograd import grad
+#import cvxpy as cp
+from scipy import optimize, sparse
+from scipy.optimize import minimize, LinearConstraint, NonlinearConstraint, Bounds
+import functools
+import do_mpc
+from casadi import * #for MPC computation, check if it does not broke things away from here
+from casadi.tools import *
+
 
 class MathHelper:
     """
@@ -18,7 +32,7 @@ class MathHelper:
     @staticmethod
     def angle_diff(a1: float, a2: float) -> float:
         """
-        Compute the difference between two angles.
+        Compute the difference a2 - a1 between two angles.
         
         Parameters:
         ----------
@@ -34,6 +48,26 @@ class MathHelper:
         assert (a1 <= math.pi and -math.pi <= a1)
         assert (a2 <= math.pi and -math.pi <= a2)
         return (((a2 - a1) + math.pi) % (2 * math.pi)) - math.pi
+
+    @staticmethod
+    def angle_sum(a1: float, a2: float) -> float:
+        """
+        Compute the difference between two angles.
+        
+        Parameters:
+        ----------
+        a1 (float): an angle in [-pi, pi]
+        a2 (float): an angle in [-pi, pi]
+        ----------
+        
+        Returns:
+        ----------
+        a2 + a1 (float): an angle in [-pi, pi]
+        ----------
+        """
+        assert (a1 <= math.pi and -math.pi <= a1)
+        assert (a2 <= math.pi and -math.pi <= a2)
+        return (((a2 + a1) + math.pi) % (2 * math.pi)) - math.pi
 
     @staticmethod
     def circleSegmentIntersection(p1, p2, r: float) -> list:
@@ -102,7 +136,58 @@ class MathHelper:
         intersections = []
         for i in sol:
             intersections.append(np.array(i) + np.array(c))
-        return intersections        
+        return intersections
+
+    @staticmethod
+    def circle_circle_intersection(c1,r1,c2,r2):
+        """
+        Compute the list of points that belong to the intersection of two circles.
+        
+        Parameters:
+        ----------
+        c1: center of the first circle (x1,y1)
+        r1 (float): the radius of the first circle
+        c2: center of the second circle (x2,y2) 
+        r2 (float): the radius of the second circle
+        ----------
+        
+        Returns:
+        ----------
+        _ (list): a list that contains zero, one, or two points, corresponding to the intersection between the two circles.
+        ----------
+        """
+        assert not(c1[0]==c2[0] and c1[1]==c2[1] and r1==r2)
+        intersections = []
+        r_min = min(r1,r2)
+        r_max = max(r1,r2)
+        if np.linalg.norm(np.array(c2)-np.array(c1))>r1+r2 or (np.linalg.norm(np.array(c2)-np.array(c1))+r_min<r_max):
+            return intersections
+        elif np.linalg.norm(np.array(c2)-np.array(c1))==r1+r2:
+            point = r1*(np.array(c2)-np.array(c1))/np.linalg.norm(np.array(c2)-np.array(c1))
+            intersections.append(point)
+            return intersections
+        else:
+            x1 = c1[0]
+            y1 = c1[1]
+            x2 = c2[0]
+            y2 = c2[1]
+            a = 2*(x2-x1)
+            b = 2*(y2-y1)
+            c = (x2-x1)**2 + (y2-y1)**2 - r2**2 + r1**2
+            delta = (2*a*c)**2 - 4*(a**2 + b**2)*(c**2 - b**2 * r1**2)
+            xp = x1 + (2*a*c - math.sqrt(delta))/(2*(a**2 + b**2))
+            xq = x1 + (2*a*c + math.sqrt(delta))/(2*(a**2 + b**2))
+            yp = 0.
+            yq = 0.
+            if b!=0:
+                yp = y1 + (c-a*(xp-x1))/b
+                yq = y1 + (c-a*(xq-x1))/b
+            else:
+                yp = y1 + math.sqrt(r2**2 - ((2*c-a**2)/(2*a))**2)
+                yp = y1 - math.sqrt(r2**2 - ((2*c-a**2)/(2*a))**2)
+            intersections.append(np.array((xp,yp)))
+            intersections.append(np.array((xq,yq)))
+        return intersections
 
     @staticmethod
     def get_cartesian_coord(v) -> np.ndarray:
@@ -144,6 +229,22 @@ class MathHelper:
             return np.array((v_norm,0))
         v_angle = math.atan2(v[1], v[0])
         return np.array((v_norm,v_angle))
+
+    @staticmethod
+    def feed_velocity(v) -> np.ndarray:#to check
+        """
+        transform a polar vector (<0,angle) to a real polar vector (>0,angle+pi)
+        """
+        assert(v[1]<= math.pi and -math.pi<= v[1])
+        r=v[0]
+        alpha=v[1]
+        if v[0]<0:
+            r=-v[0]
+            #alpha=MathHelper.angle_diff(v[1],math.pi)
+            alpha=MathHelper.angle_sum(v[1],math.pi)
+        w=np.array((r,alpha))
+        return MathHelper.get_cartesian_coord(w)
+
     
     @staticmethod
     def get_angle_points(p1s, p1e, p2s, p2e) -> float:
@@ -210,6 +311,81 @@ class MathHelper:
         angle = MathHelper.angle_diff(v1[1],v2[1])
         return angle
 
+    @staticmethod
+    def line_line_intersection(p1,p2,p3,p4):
+        """
+        compute the point intersection between the two infinite lines given by points (p1,p2) and (p3,p4)
+        """
+        inter=None
+        denom=(p1[0]-p2[0])*(p3[1]-p4[1])-(p1[1]-p2[1])*(p3[0]-p4[0])
+        if denom==0:#parrallel or identical TODO:what answer if identical ? (because inter non-empty then)
+            return inter
+        else:
+            px=((p1[0]*p2[1]-p1[1]*p2[0])*(p3[0]-p4[0])-(p1[0]-p2[0])*(p3[0]*p4[1]-p3[1]*p4[0]))/denom
+            py=((p1[0]*p2[1]-p1[1]*p2[0])*(p3[1]-p4[1])-(p1[1]-p2[1])*(p3[0]*p4[1]-p3[1]*p4[0]))/denom
+        inter = np.array((px,py))
+        return inter
+
+    @staticmethod
+    def segment_segment_intersection(p1,p2,p3,p4):
+        """
+        compute the point intersection between the two segment lines given by points (p1,p2) and (p3,p4)
+        """
+        inter=None
+        denom=(p1[0]-p2[0])(p3[1]-p4[1])-(p1[1]-p2[1])(p3[0]-p4[0])
+        if denom==0:#parrallel TODO:what answer if common intersection ? (should return a segment)
+            return inter
+        else:
+            t=((p1[0]-p3[0])*(p3[1]-p4[1])-(p1[1]-p3[1])*(p3[0]-p4[0]))/denom
+            u=-((p1[0]-p2[0])*(p1[1]-p3[1])-(p1[1]-p2[1])*(p1[0]-p3[0]))/denom
+            if (0<=t and t<=1) and (0<=u and u<=1):
+                px=((p1[0]*p2[1]-p1[1]*p2[0])*(p3[0]-p4[0])-(p1[0]-p2[0])*(p3[0]*p4[1]-p3[1]*p4[0]))/denom
+                py=((p1[0]*p2[1]-p1[1]*p2[0])*(p3[1]-p4[1])-(p1[1]-p2[1])*(p3[0]*p4[1]-p3[1]*p4[0]))/denom
+                inter = np.array((px,py))
+                return inter
+            else:
+                return inter
+
+    @staticmethod
+    def line_segment_intersection(p1,p2,p3,p4):
+        """
+        compute the point intersection between a line given by points (p1,p2) and a segment given by points (p3,p4)
+        """
+        inter=None
+        denom=(p1[0]-p2[0])*(p3[1]-p4[1])-(p1[1]-p2[1])*(p3[0]-p4[0])
+        if denom==0:#parrallel TODO:what answer if common intersection ? (should return a segment)
+            return inter
+        else:
+            #t=((p1[0]-p3[0])(p3[1]-p4[1])-(p1[1]-p3[1])(p3[0]-p4[0]))/denom
+            u=-((p1[0]-p2[0])*(p1[1]-p3[1])-(p1[1]-p2[1])*(p1[0]-p3[0]))/denom
+            if (0<=u and u<=1):
+                px=((p1[0]*p2[1]-p1[1]*p2[0])*(p3[0]-p4[0])-(p1[0]-p2[0])*(p3[0]*p4[1]-p3[1]*p4[0]))/denom
+                py=((p1[0]*p2[1]-p1[1]*p2[0])*(p3[1]-p4[1])-(p1[1]-p2[1])*(p3[0]*p4[1]-p3[1]*p4[0]))/denom
+                inter = np.array((px,py))
+                return inter
+            else:
+                return inter
+
+    @staticmethod
+    def semiline_segment_intersection(p1,p2,p3,p4):
+        """
+        compute the point intersection between a semi-line given by an extremety point p1 and a belonging point p2 and a segment given by points (p3,p4)
+        """
+        inter=None
+        denom=(p1[0]-p2[0])*(p3[1]-p4[1])-(p1[1]-p2[1])*(p3[0]-p4[0])
+        if denom==0:#parrallel TODO:what answer if common intersection ? (should return a segment)
+            return inter
+        else:
+            t=((p1[0]-p3[0])*(p3[1]-p4[1])-(p1[1]-p3[1])*(p3[0]-p4[0]))/denom
+            u=-((p1[0]-p2[0])*(p1[1]-p3[1])-(p1[1]-p2[1])*(p1[0]-p3[0]))/denom
+            if (0<=t) and (0<=u and u<=1):
+                px=((p1[0]*p2[1]-p1[1]*p2[0])*(p3[0]-p4[0])-(p1[0]-p2[0])*(p3[0]*p4[1]-p3[1]*p4[0]))/denom
+                py=((p1[0]*p2[1]-p1[1]*p2[0])*(p3[1]-p4[1])-(p1[1]-p2[1])*(p3[0]*p4[1]-p3[1]*p4[0]))/denom
+                inter = np.array((px,py))
+                return inter
+            else:
+                return inter
+
 class Obstacle:
     """
     A simple structure to save position and size of an obstacle.
@@ -233,7 +409,8 @@ class BabyRobot(Obstacle):
     """
     A structure shared among Robot and Planner class, it encodes all necessary parameters of the robot which are independent of the planner used.
     """
-    def __init__(self, pos: np.ndarray, theta: float = 0., speed_norm: float = 0., speed_angle: float = 0., max_speed: float = 10., size: float = 1., name: str = "default_name_robot"):
+    def __init__(self, pos: np.ndarray, theta: float = 0., speed_norm: float = 0., speed_angle: float = 0., speed_max: float = 10., size: float = 1., name: str = "default_name_robot",
+                acc_max: float = 1., brake_max: float = 1, wheel_angle_max: float = math.pi/4, speed_min: float = -5., wheel_acc_max: float = 2*math.pi):
         """
         Create a Babyrobot.
         
@@ -241,27 +418,47 @@ class BabyRobot(Obstacle):
         ----------
         pos (np.ndarray): position of the babyrobot
         theta (float): globlal angle of the babyrobot
-        speed_norm (float): the norm of the current velocity of the babyrobot
-        speed_angle (float): the global angle of the current velocity of the robot
-        max_speed (float): the maximal speed the robot can go
+        speed_norm (float): the norm of the current velocity of the babyrobot, no longer a norm
+        speed_angle (float): the global angle (heading) of the current velocity of the robot
+        speed_max (float): the maximal speed the robot can go
         size (float): the robot size, considering it is a circle
         name (str): name of the robot
+        acc_max (float): maximal acceleration/throttle
+        brake_max (float): maximal decelaration
+        wheel_angle_max (float): maximal steering angle (angle between wheel heading and vehicle heading)
+        speed_min (float): minimal speed of the robot (generally negative)
+        wheel_acc_max (float): maximal angular acceleration of the steering angle
         ----------
 
         Additionnal attributes:
         ----------
         velocity (np.ndarray): the velocity of the babyrobot in cartesian coordinates
+        history_pose (list): a list containing all previous states of the robot
+        wheel_desired (float): some planner need desired angle
+        wheel_angle (float): the actual steering angle
+        acc_engine (float): the actual acceleration/throttle
+        wheel_acc (float): the actual angular steering acceleration
         ----------
+
+        Notes: Babyrobot now have kinematics, this will be moved to daughter classes in the future.
         """
-        self.pos = pos
+        super().__init__(pos,size)
         self.theta = theta
         self.speed_norm = speed_norm
         self.speed_angle = speed_angle
-        self.velocity = MathHelper.get_cartesian_coord((speed_norm,speed_angle))
-        self.max_speed = max_speed
+        self.velocity = MathHelper.feed_velocity((speed_norm,speed_angle))
+        self.speed_max = speed_max
         self.history_pose = []
-        self.size = size
         self.name = name
+        self.acc_max = acc_max
+        self.brake_max = brake_max
+        self.wheel_angle_max = wheel_angle_max
+        self.speed_min = speed_min
+        self.wheel_angle:float = 0.
+        self.acc_engine:float = 0.
+        self.wheel_acc_max = wheel_acc_max
+        self.wheel_acc:float = 0.
+        self.wheel_desired: float = 0.
 
     def pos_update(self,pos: np.ndarray):
         """
@@ -279,6 +476,119 @@ class BabyRobot(Obstacle):
         """
         for i in range(len(pos)):
             self.pos[i]=pos[i]
+
+    def update_wheel_angle(self,dt:float=0.1):
+        """
+        given dt (and wheel_acc), update the actual wheel_angle w.r.t. the robot constraints.
+        """
+        self.wheel_angle=MathHelper.angle_sum(self.wheel_angle,dt*self.wheel_acc)
+        if abs(self.wheel_angle)>self.wheel_angle_max:
+            if self.wheel_angle<0:
+                self.wheel_angle=-self.wheel_angle_max
+            else:
+                self.wheel_angle=self.wheel_angle_max
+
+    def get_wheel_angle(self, dt:float = 0.1):
+        """
+        given dt (and wheel_desired), update the actual wheel_acc and wheel_angle w.r.t. the robot constraints.
+        """
+        need_turn=MathHelper.angle_diff(self.wheel_angle,self.wheel_desired)/dt
+        if abs(need_turn)>self.wheel_acc_max:
+            if need_turn<0:
+                self.wheel_acc=-self.wheel_acc_max
+            else:
+                self.wheel_acc=self.wheel_acc_max
+        else:
+            self.wheel_acc=need_turn
+        self.update_wheel_angle(dt)
+
+    
+
+    def feed_kinematic(self, acc: np.ndarray, dt: float = 0.1):
+        """
+        A method to feed the acceleration vector (given in cartesian coordinate) to the robot kinematic.
+
+        Parameters:
+        ----------
+        acc (np.ndarray): cartesian coordinate of the acceleration vector
+        dt (float): the time-step to consider
+        ----------
+        
+        Returns:
+        ----------
+        A modified wheel_acc, wheel_angle, and acc_engine.
+        ----------
+        """
+
+        #split the acceleration vector into wheel rotation and engine acceleration/deceleration
+        acc_pol=MathHelper.get_polar_coord(acc)
+        wheel_turn_desired=MathHelper.angle_diff(self.theta,acc_pol[1])
+        #if negative speed, turn right instead of left and vice-versa (correction will end with feed_kinematic).
+        if (self.speed_norm<0):
+            wheel_turn_desired=MathHelper.angle_diff(wheel_turn_desired,0)
+        engine_push=acc_pol[0]
+        #if desired_turn head behind the vehicle, acceleration becomes negatives.
+        if abs(wheel_turn_desired)>math.pi/2:
+            engine_push=-engine_push
+        if abs(wheel_turn_desired)>abs(self.wheel_angle_max):
+            if wheel_turn_desired<0:
+                self.wheel_desired=-self.wheel_angle_max
+            else:
+                self.wheel_desired=self.wheel_angle_max
+        else:
+            self.wheel_desired=wheel_turn_desired
+        self.get_wheel_angle(dt)
+        
+        if engine_push<0 and engine_push<self.brake_max:
+            self.acc_engine=-self.brake_max
+        elif engine_push>0 and engine_push>self.acc_max:
+            self.acc_engine=self.acc_max
+        else:
+            self.acc_engine=engine_push
+
+    def update_velocity(self, dt:float = 0.1):
+        """
+        update the velocity of the vehicle accordingly to its kinematic
+        """
+        self.speed_norm=max(min(self.speed_norm+dt*self.acc_engine,self.speed_max),self.speed_min)
+        self.speed_angle=MathHelper.angle_sum(self.speed_angle,dt*(self.speed_norm/self.size)*math.tan(self.wheel_angle))
+        #if self.speed_norm<0:#to verify
+        #    self.theta=MathHelper.angle_sum(self.speed_angle,math.pi)
+        #else:
+        #    self.theta=self.speed_angle
+        self.theta=self.speed_angle
+        self.velocity=MathHelper.feed_velocity((self.speed_norm,self.speed_angle))
+
+    def update_pos(self,dt:float=0.1):
+        """
+        update the robot position in a such way that pointers keep pointing it.
+        """
+        for i in range(len(self.pos)):
+            #this is used to avoid making copy as we have many pointer on it in general
+            self.pos[i]=self.pos[i]+dt*self.velocity[i]
+
+    def move(self,acc:np.ndarray,dt:float):
+        """
+        given an acceleration vector and the time-step, update the robot state (kinematic parameters, velocity and position)
+        """
+        self.feed_kinematic(acc)
+        self.update_velocity(dt)
+        self.update_pos(dt)
+
+    def copy(self):
+        """
+        Create a new BabyRobot instance by copying this one.
+        """
+        new_babyrobot = BabyRobot(self.pos.copy(),self.theta,self.speed_norm,self.speed_angle, self.speed_max, self.size, self.name,
+                                  self.acc_max,self.brake_max,self.wheel_angle_max,self.speed_min,self.wheel_acc_max)
+        new_babyrobot.wheel_angle=self.wheel_angle
+        new_babyrobot.acc_engine=self.acc_engine
+        new_babyrobot.wheel_desired=self.wheel_desired
+        new_babyrobot.wheel_acc=self.wheel_acc
+        new_babyrobot.name+="_copy"
+        new_babyrobot.history_pose = self.history_pose.copy()
+        new_babyrobot.velocity = MathHelper.feed_velocity((new_babyrobot.speed_norm,new_babyrobot.speed_angle))
+        return new_babyrobot
 
 class Agent(ABC):
     """
@@ -535,7 +845,8 @@ class Grid(Env):
                 obsl = True
                 continue
             if obsl:
-                nobs = re.search("\((-?\d+.?\d*),\s?(-?\d+.?\d*)\)",l[i])
+                #nobs = re.search("\((-?\d+.?\d*),\s?(-?\d+.?\d*)\)",l[i])#bug when number written as: XeY
+                nobs = re.search("\((-?\d+.?\d*e?-?\d*),\s?(-?\d+.?\d*e?-?\d*)\)",l[i])
                 if nobs:
                     self.obstacles.append((float(nobs.group(1)),float(nobs.group(2))))
                 else:
@@ -614,10 +925,17 @@ class Map(Env):
         ]
 
     def from_grid_to_map(self, grid, size = 0.5):
+        """
+        transform a grid env to a map env where obstacles cells are transformed to circles. 
+        """
         for i in grid.obstacles:
             self.obs_circ.append(Obstacle(np.array((i[0],i[1])),size))#considering that grid have tuple (x,y) as obstacles.
 
     def avoid_overlap(self):
+        """
+        move circles obstacles to avoid overlap.
+        known problem: if a circle is in between two others, it can move back and forth.
+        """
         overlap = True
         move_buffer = []
         while overlap:
@@ -723,7 +1041,7 @@ class Robot(Agent):
         max_angle (float): the maximal angle (between two time steps) made by the BabyRobot during its travel
         ----------
         """
-        self.robot = robot #BabyRobot(pos, theta, speed_norm, speed_angle, max_speed, size, name)
+        self.robot = robot #BabyRobot(pos, theta, speed_norm, speed_angle, speed_max, size, name)
         self.robot.history_pose.append([self.robot.pos.copy(),self.robot.theta,self.robot.speed_norm,self.robot.speed_angle,self.robot.velocity])
         self.path_length = 0.
         self.sum_angle = (0.,0.,0.)
@@ -1358,13 +1676,17 @@ class LocalPlanner(Planner):
         t_start (float): the time, in the simulator, when the agent start to move, 0 by default
         lookahead_dist (float): a distance used to setup temporary goals based on the global path, 10 by default
         nb_collision (tuple): encodes each collision already encountered, of the form (n, [t_1, ..., t_n]), (0,[]) by default
+        reached (tuple:(boolean,float)): store if the goal has been reached and if yes, when.
+        g_planner: global planner to follow (default is none)
+        path: path defined by the global planner
+        goal_current: the current goal position
         ----------
         """
         self.start = start
         self.goal = goal
         self.env = env
         self.robot = robot
-        self.reached = (False,0)
+        self.reached = (False,0.)
         self.g_planner = None
         self.path = None
         self.goal_current = goal
@@ -1373,9 +1695,11 @@ class LocalPlanner(Planner):
         self.t_start = kwargs["t_start"] if "t_start" in kwargs.keys() else 0.
         self.lookahead_dist = kwargs["lookahead_dist"] if "lookahead_dist" in kwargs.keys() else 10.
         self.nb_collision = kwargs["nb_collision"] if "nb_collision" in kwargs.keys() else [0,[]]#else (n,[time_1,...,time_n])
+        self.goal_method = kwargs["goal_method"] if "goal_method" in kwargs.keys() else "goal"
         self.comp_time = 0.
         self.run_count = 0
         self.obs_lists = [self.obstacles]#a list of list of obstacles.
+        self.detection_range= kwargs["detection_range"] if "detection_range" in kwargs.keys() else 4.
     
     def dist(self, start: np.ndarray, end: np.ndarray) -> float:
         """
@@ -1433,6 +1757,9 @@ class LocalPlanner(Planner):
             assert isinstance(self.obstacles, (set,list))
 
     def obs_detection_circle(self, r):
+        """
+        update the obstacle list with respect to the radius of detection.
+        """
         obs = []
         for i in self.obs_lists:
             for j in i:
@@ -1441,6 +1768,9 @@ class LocalPlanner(Planner):
         self.update_obstacles(obs)
     
     def obs_detection_rays(self, rays):
+        """
+        update the obstacle list with respect to rays of detection.
+        """
         obs = []
         for i in self.obs_lists:
             for j in i:
@@ -1453,7 +1783,7 @@ class LocalPlanner(Planner):
         """
         Compute the point on the global path that is exactly at distance self.lookahead_dist from the BabyRobot, close to the goal.
         If there is no such point, return the after closest point defined in path.
-        If we arre close enough to the goal, return the goal instead.
+        If we are close enough to the goal, return the goal instead.
 
         Returns:
         ----------
@@ -1498,8 +1828,7 @@ class LocalPlanner(Planner):
 
     def local_minima_detection(self, vrange: float, turning: float, time: float, dt: float, prec: float, t: float) -> (bool, np.ndarray):
         """
-        IN CONSTRUCTION
-        Detect if the robot currently locked in a local minima. 
+        Detect if the robot is currently locked in a local minima. 
 
         Parameters:
         ----------
@@ -1519,10 +1848,6 @@ class LocalPlanner(Planner):
         sumt = 0.
         mean_pose = np.array((0.,0.))
         nb_last_pose = int(time/dt)
-        # if self.robot.speed_norm < self.robot.max_speed/10:
-        #     #in_local_minima = True
-        #     print(nb_last_pose, self.robot.pos.copy())
-        #     return (True, self.robot.pos.copy())
         if len(self.robot.history_pose)>nb_last_pose+1:
             pos_start = len(self.robot.history_pose)-nb_last_pose-1
             pos_end = len(self.robot.history_pose)-2
@@ -1535,22 +1860,20 @@ class LocalPlanner(Planner):
                 mean_pose += self.robot.history_pose[i+1][0]
             mean_pose = 1/nb_last_pose * mean_pose
             if np.linalg.norm(self.robot.pos - mean_pose)<vrange and sumt>turning:
-                #in_local_minima = True
                 #print("area detected: ", nb_last_pose, pos_start, pos_end, mean_pose, ", time: ", t)
                 return (True, Obstacle(mean_pose,0.))
         #it remains one case when the local env in the robot perspective does not change, this can happens in case of moving obstacles. (circle centered on the goal)
         return (False, mean_pose)
 
     def collision_detection(self):
+        """
+        update nb_collision if a collision happens between self and an obstacle.
+        """
         for i in self.obs_lists:
             for j in i:
                 if np.linalg.norm(self.robot.pos - j.pos) - self.robot.size - j.size <= 0:
                     self.nb_collision[0]+=1
                     self.nb_collision[1].append(j)
-                    #return (True, j)
-            if self.nb_collision!=[0,[]]:
-                print(self.nb_collision)
-        #return (False, None)
 
 class LocalStupid(LocalPlanner):
     """
@@ -1585,7 +1908,7 @@ class LocalStupid(LocalPlanner):
         """
         if t>=self.t_start and self.reached[0] == False:
             vect_dir = np.array(self.goal) - np.array(self.start)
-            nv = (vect_dir/np.linalg.norm(vect_dir)) * self.robot.max_speed
+            nv = (vect_dir/np.linalg.norm(vect_dir)) * self.robot.speed_max
             self.robot.velocity = nv
             new_pos = self.robot.pos + dt * nv
             self.robot.pos_update(new_pos)
@@ -1621,6 +1944,9 @@ class InputPlanner(LocalPlanner):
         self.rng = kwargs["rng"] if "rng" in kwargs.keys() else np.random.RandomState(0)
 
     def set_input(self):
+        """
+        set random inputs.
+        """
         rinput = self.rng.random_sample((1,2))
         self.input_x = 2*rinput[0][0]-1
         self.input_y = 2*rinput[0][1]-1
@@ -1639,16 +1965,16 @@ class InputPlanner(LocalPlanner):
             self.set_input()
             vect_dir = np.array((self.input_x,self.input_y))
             if self.acts_on_speed:
-                nv = vect_dir * self.robot.max_speed
+                nv = vect_dir * self.robot.speed_max
             else:
                 #v = MathHelper.get_cartesian_coord([self.robot.speed_norm,self.robot.speed_angle])
                 v = self.robot.velocity
-                nv = dt * vect_dir * self.robot.max_speed + v
-            if np.linalg.norm(nv)>self.robot.max_speed:
-                    nv = nv/np.linalg.norm(nv) * self.robot.max_speed
+                nv = dt * vect_dir * self.robot.speed_max + v
+            if np.linalg.norm(nv)>self.robot.speed_max:
+                    nv = nv/np.linalg.norm(nv) * self.robot.speed_max
             #nvp = MathHelper.get_polar_coord(nv)
-            #if nvp[0] > self.robot.max_speed:
-            #    nvp[0] = self.robot.max_speed
+            #if nvp[0] > self.robot.speed_max:
+            #    nvp[0] = self.robot.speed_max
             #    nv = MathHelper.get_cartesian_coord(nvp)
             self.robot.velocity = nv
             new_pos = self.robot.pos + dt * nv
@@ -1776,10 +2102,6 @@ class FAPF(LocalPlanner):
         attr_force = self.k_attr * (np.array(goal) - self.robot.pos)
         if self.attr_look and np.linalg.norm(attr_force)>self.lookahead_dist:
                 attr_force = attr_force/np.linalg.norm(attr_force) * self.lookahead_dist
-        #afp = MathHelper.get_polar_coord(attr_force)
-        #if self.attr_look and afp[0] > self.lookahead_dist:
-        #    afp[0] = self.lookahead_dist
-        #    attr_force = MathHelper.get_cartesian_coord(afp)
         return attr_force
 
     def get_inertia(self, dt: float) -> np.ndarray:
@@ -1801,12 +2123,10 @@ class FAPF(LocalPlanner):
         nb_iner = int(self.t_inertia/dt)
         if len(self.robot.history_pose)>nb_iner:
             for i in self.robot.history_pose[-nb_iner:-1]:
-                #inertia += MathHelper.get_cartesian_coord((i[2],i[3]))
                 inertia += i[4]
             inertia = inertia/nb_iner
         else:
             for i in self.robot.history_pose:
-                #inertia += MathHelper.get_cartesian_coord((i[2],i[3]))
                 inertia += i[4]
             inertia = inertia/len(self.robot.history_pose)
         dist_to_goal = MathHelper.get_polar_coord(np.array(self.goal) - self.robot.pos)[0]
@@ -1814,9 +2134,40 @@ class FAPF(LocalPlanner):
             return self.k_inertia * inertia * (dist_to_goal/self.lookahead_dist)
         return self.k_inertia * inertia
 
-    def run(self, dt: float, t: float):
+    def plan(self,dt:float, t:float):
         """
-        Run one step of APF, moving the BabyRobot and saving its data.
+        Compute the total force.
+        """
+        net_force=np.array((0.,0.))
+        if t>=self.t_start and self.reached[0] == False:
+            (rep_force, tan_force) = self.get_repulsive_force(self.obstacles)
+            if self.goal_method == "lookahead":
+                self.goal_current = self.getLookaheadPoint()
+            else:
+                self.goal_current = self.goal
+            attr_force = self.get_attractive_force(self.goal_current)
+            if self.inertia:
+                inertia = self.get_inertia(dt)
+            else:
+                inertia = np.array((0.,0.))
+            net_force = attr_force + rep_force + tan_force + inertia
+        return net_force
+
+    def run(self, dt:float, t:float):
+        """
+        Compute the total force and moves the robot.
+        """
+        s_t = time.process_time_ns()
+        acc=self.plan(dt,t)
+        self.robot.move(acc,dt)
+        e_t = time.process_time_ns()
+        self.comp_time += e_t - s_t
+        self.run_count += 1
+        self.robot.history_pose.append([self.robot.pos.copy(),self.robot.theta,self.robot.speed_norm,self.robot.speed_angle, self.robot.velocity])
+
+    def run2(self, dt: float, t: float):
+        """
+        Run one step of APF, moving the BabyRobot and saving its data. (old function used for no kinematic).
         
         Parameters:
         ----------
@@ -1840,15 +2191,10 @@ class FAPF(LocalPlanner):
             if self.acts_on_speed:
                 nv = net_force
             else:
-                #v = MathHelper.get_cartesian_coord([self.robot.speed_norm,self.robot.speed_angle])
                 v = self.robot.velocity
                 nv = dt * net_force + v
-            if np.linalg.norm(nv)>self.robot.max_speed:
-                nv = nv/np.linalg.norm(nv) * self.robot.max_speed
-            #nvp = MathHelper.get_polar_coord(nv)
-            #if nvp[0] > self.robot.max_speed:
-            #    nvp[0] = self.robot.max_speed
-            #    nv = MathHelper.get_cartesian_coord(nvp)
+            if np.linalg.norm(nv)>self.robot.speed_max:
+                nv = nv/np.linalg.norm(nv) * self.robot.speed_max
             self.robot.velocity = nv
             new_pos = self.robot.pos + dt * nv
             self.robot.pos_update(new_pos)
@@ -2033,10 +2379,6 @@ class FDAPF(LocalPlanner):
         attr_force = self.k_attr * (np.array(goal) - self.robot.pos)
         if self.attr_look and np.linalg.norm(attr_force)>self.lookahead_dist:
                 attr_force = attr_force/np.linalg.norm(attr_force) * self.lookahead_dist
-        #afp = MathHelper.get_polar_coord(attr_force)
-        #if self.attr_look and afp[0] > self.lookahead_dist:
-        #    afp[0] = self.lookahead_dist
-        #    attr_force = MathHelper.get_cartesian_coord(afp)
         return attr_force
 
     def get_inertia(self, dt: float) -> np.ndarray:
@@ -2058,12 +2400,10 @@ class FDAPF(LocalPlanner):
         nb_iner = int(self.t_inertia/dt)
         if len(self.robot.history_pose)>nb_iner:
             for i in self.robot.history_pose[-nb_iner:-1]:
-                #inertia += MathHelper.get_cartesian_coord((i[2],i[3]))
                 inertia += i[4]
             inertia = inertia/nb_iner
         else:
             for i in self.robot.history_pose:
-                #inertia += MathHelper.get_cartesian_coord((i[2],i[3]))
                 inertia += i[4]
             inertia = inertia/len(self.robot.history_pose)
         dist_to_goal = MathHelper.get_polar_coord(np.array(self.goal) - self.robot.pos)[0]
@@ -2071,9 +2411,53 @@ class FDAPF(LocalPlanner):
             return self.k_inertia * inertia * (dist_to_goal/self.lookahead_dist)
         return self.k_inertia * inertia
 
-    def run(self, dt: float, t: float):
+    def plan(self,dt:float,t:float):
         """
-        Run one step of DAPF, moving the BabyRobot and saving its data.
+        Check for local minima and compute the total force.
+        """
+        net_force=np.array((0.,0.))
+        if t>=self.t_start and self.reached[0] == False:
+            #need to study the possible realistic parameters for local minima detection
+            in_lm = False
+            if abs(self.recent_lm) < dt:
+                while len(self.n_vobs) >= 1:
+                    #print("self.n_vobs: ", self.n_vobs)
+                    self.obstacles.append(self.n_vobs.pop())
+                (in_lm, n_pos) = self.local_minima_detection(self.robot.speed_max*2, 2*math.pi, 6., dt, 0.1, t)
+                if in_lm:
+                    self.recent_lm = 2.
+                    self.n_vobs.append(n_pos)
+            else:
+                self.recent_lm -= dt
+            self.set_dynamic_constant_forces(dt<self.recent_lm<=2., dt)
+            (rep_force, tan_force) = self.get_repulsive_force(self.obstacles)
+            if self.goal_method == "lookahead":
+                self.goal_current = self.getLookaheadPoint()
+            else:
+                self.goal_current = self.goal
+            attr_force = self.get_attractive_force(self.goal_current)
+            if self.inertia:
+                inertia = self.get_inertia(dt)
+            else:
+                inertia = np.array((0.,0.))
+            net_force = attr_force + rep_force + tan_force + inertia
+        return net_force
+
+    def run(self, dt:float, t:float):
+        """
+        Compute the total force and moves the robot.
+        """
+        s_t = time.process_time_ns()
+        acc=self.plan(dt,t)
+        self.robot.move(acc,dt)
+        e_t = time.process_time_ns()
+        self.comp_time += e_t - s_t
+        self.run_count += 1
+        self.robot.history_pose.append([self.robot.pos.copy(),self.robot.theta,self.robot.speed_norm,self.robot.speed_angle, self.robot.velocity])
+
+    def run2(self, dt: float, t: float):
+        """
+        Run one step of DAPF, moving the BabyRobot and saving its data. (old function used for no kinematic).
         
         Parameters:
         ----------
@@ -2089,7 +2473,7 @@ class FDAPF(LocalPlanner):
                 while len(self.n_vobs) >= 1:
                     #print("self.n_vobs: ", self.n_vobs)
                     self.obstacles.append(self.n_vobs.pop())
-                (in_lm, n_pos) = self.local_minima_detection(self.robot.max_speed*2, 2*math.pi, 6., dt, 0.1, t)
+                (in_lm, n_pos) = self.local_minima_detection(self.robot.speed_max*2, 2*math.pi, 6., dt, 0.1, t)
                 if in_lm:
                     self.recent_lm = 2.
                     self.n_vobs.append(n_pos)
@@ -2112,11 +2496,11 @@ class FDAPF(LocalPlanner):
             else:
                 v = MathHelper.get_cartesian_coord([self.robot.speed_norm,self.robot.speed_angle])
                 nv = dt * net_force + v
-            if np.linalg.norm(nv)>self.robot.max_speed:
-                nv = nv/np.linalg.norm(nv) * self.robot.max_speed
+            if np.linalg.norm(nv)>self.robot.speed_max:
+                nv = nv/np.linalg.norm(nv) * self.robot.speed_max
             #nvp = MathHelper.get_polar_coord(nv)
-            #if nvp[0] > self.robot.max_speed:
-            #    nvp[0] = self.robot.max_speed
+            #if nvp[0] > self.robot.speed_max:
+            #    nvp[0] = self.robot.speed_max
             #    nv = MathHelper.get_cartesian_coord(nvp)
             self.robot.velocity = nv
             new_pos = self.robot.pos + dt * nv
@@ -2130,6 +2514,451 @@ class FDAPF(LocalPlanner):
             self.run_count += 1
         self.robot.history_pose.append([self.robot.pos.copy(),self.robot.theta,self.robot.speed_norm,self.robot.speed_angle,self.robot.velocity])
 
+class DWA(LocalPlanner):
+    """
+    A class for the Dynamic Window Approach algorithm.
+    """
+    def __init__(self, robot:BabyRobot, start, goal, env, obstacles, w_heading: float = 0.2, w_obs: float = 0.4, w_velocity: float = 0.2, 
+                 predict_time: float=0.4, obs_eval_bound: float = 1., acc_res: float = 0.1, turn_res: float = 0.1, **kwargs):
+        """
+        Create a DWA.
+
+        Parameters:
+        robot (BabyRobot): the BabyRobot that needs to follow this local planner
+        start (np.ndarray): the starting point of the path
+        goal (np.ndarray): the end point of the path
+        env (Env): the environment, containing static obstacles
+        obstacles: the obstacles this agent have to consider
+        w_heading (float): weight for evaluating heading at the end of the predicted trajectory
+        w_obs (float): weight for evaluating distance with obstacles along predicted trajectory
+        w_velocity (float): weight for evaluating velocity at the end of the predicted trajectory
+        predict_time (float): number of time unit (usually seconds) to predict
+        obs_eval_bound (float): upper boundary for distance evaluation with obstacles
+        acc_res (float): sampling resolution for acceleration
+        turn_res (float): sampling resolution for turning
+        """
+        super().__init__(robot, start, goal, env, obstacles, **kwargs)
+        self.w_heading=w_heading
+        self.w_obs=w_obs
+        self.w_velocity=w_velocity
+        self.predict_time=predict_time
+        self.obs_eval_bound=obs_eval_bound
+        #self.acc_res=acc_res
+        #self.turn_res=turn_res
+        self.acc_res=(self.robot.acc_max+self.robot.brake_max)/4
+        self.turn_res=(self.robot.wheel_acc_max)/20
+        self.g_planner = GlobalStupid(start, goal, env)
+        self.path = self.g_planner.run()
+        self.cached_path=[]
+        self.future_robot=self.robot.copy()
+
+    def dynamic_window(self, dt:float=0.1):
+        """
+        Create the dynamic (sampling) window.
+        """
+        #get the maximal effective wheel_acc and acc_engine. change to reachable wheel_angle instead of wheel_acc (same for acc?)
+        left_acc= 0.
+        if MathHelper.angle_sum(self.robot.wheel_angle,dt*self.robot.wheel_acc_max)>self.robot.wheel_angle_max:
+            left_acc=MathHelper.angle_diff(self.robot.wheel_angle,self.robot.wheel_angle_max)/dt
+        else:
+            left_acc=self.robot.wheel_acc_max
+
+        right_acc= 0.
+        if MathHelper.angle_sum(self.robot.wheel_angle,-dt*self.robot.wheel_acc_max)<-self.robot.wheel_angle_max:
+            right_acc=MathHelper.angle_diff(self.robot.wheel_angle,-self.robot.wheel_angle_max)/dt
+        else:
+            right_acc=-self.robot.wheel_acc_max
+
+        forward_acc=0.
+        if self.robot.speed_norm+dt*self.robot.acc_max>self.robot.speed_max:
+            forward_acc=(self.robot.speed_max-self.robot.speed_norm)/dt
+        else:
+            forward_acc=self.robot.acc_max
+
+        backward_acc=0.
+        if self.robot.speed_norm-dt*self.robot.brake_max<self.robot.speed_min:
+            backward_acc=(self.robot.speed_min-self.robot.speed_norm)/dt
+        else:
+            backward_acc=-self.robot.brake_max
+
+        return (right_acc,left_acc,backward_acc,forward_acc)
+
+    def gen_traj(self,acc,turn,dt:float=0.1):
+        """
+        Generate predictive trajectories w.r.t the dynamic (sampling) window.
+        """
+        steps=int(self.predict_time/dt)
+        future_robot=self.robot.copy()
+        future_robot.acc_engine=acc
+        future_robot.wheel_acc=turn
+        traj=[]
+        future_robot.update_wheel_angle(dt)
+        future_robot.update_velocity(dt)
+        future_robot.update_pos(dt)
+        traj.append([future_robot.pos.copy(),future_robot.theta,future_robot.speed_norm,future_robot.speed_angle, future_robot.velocity,future_robot.acc_engine,future_robot.wheel_acc])
+        future_robot.acc_engine=0.
+        future_robot.wheel_acc=0.
+        for i in range(1,steps):
+            if np.linalg.norm(np.array(future_robot.pos) - np.array(self.goal)) < 0.1:
+                break
+            future_robot.update_wheel_angle(dt)
+            future_robot.update_velocity(dt)
+            future_robot.update_pos(dt)
+            traj.append([future_robot.pos.copy(),future_robot.theta,future_robot.speed_norm,future_robot.speed_angle, future_robot.velocity,future_robot.acc_engine,future_robot.wheel_acc])
+        return traj
+
+    def eval(self, window,dt:float=0.1):
+        """
+        Create and evaluate all sampled trajectories.
+        """
+        eval=[]
+        trajs=[]
+        pos_obs=[obs.pos for obs in self.obstacles]
+        npobs=np.array(pos_obs)
+        #two loops to make argmax (taking the first occurence in case of equality) as stable as possible
+        turn=(window[1]-window[0])/2
+        while turn<=window[1]:
+            acc=window[3]
+            while acc>=window[2]:
+                traj=self.gen_traj(acc,turn,dt)
+                last_state=traj[-1]
+
+                #traj_heading=0
+                eval_heading = math.pi - abs(MathHelper.get_angle_points(last_state[0],self.goal.copy(),last_state[0],last_state[0]+MathHelper.get_cartesian_coord(np.array((1,last_state[1])))))
+                #for j in traj:
+                #    traj_heading=max(traj_heading,abs(MathHelper.get_angle_points(j[0],self.goal.copy(),j[0],j[0]+MathHelper.get_cartesian_coord(np.array((1,j[1]))))))
+                #eval_heading=(2*eval_heading-traj_heading)/3
+                
+                pos_list=[t[0] for t in traj]
+                nptraj=np.array(pos_list)
+                #assuming non-sized obstacles for now
+                D=cdist(npobs,nptraj)
+                min_D=np.min(D)
+                eval_dist=max(0,min(min_D-self.robot.size,self.obs_eval_bound))
+
+                #eval_dist=self.obs_eval_bound
+                #for i in self.obstacles:
+                #    for j in traj:
+                #        d = np.linalg.norm(j[0] - i.pos)
+                #        dist = max(0,d-self.robot.size-i.size)
+                #        eval_dist=min(eval_dist,dist)
+                #        if eval_dist==0:
+                #            break
+                #    if eval_dist==0:
+                #        break
+                
+                eval_vel=(last_state[2])
+                eval.append([turn,acc,eval_heading,eval_dist,eval_vel])
+                trajs.append(traj)
+                acc-=self.acc_res
+            turn+=self.turn_res
+        turn=(window[1]-window[0])/2
+        turn-=self.turn_res
+        while turn>=window[0]:
+            acc=window[3]
+            while acc>=window[2]:
+                traj=self.gen_traj(acc,turn,dt)
+                last_state=traj[-1]
+
+                #traj_heading=0
+                eval_heading = math.pi - abs(MathHelper.get_angle_points(last_state[0],self.goal.copy(),last_state[0],last_state[0]+MathHelper.get_cartesian_coord(np.array((1,last_state[1])))))
+                #for j in traj:
+                #    traj_heading=max(traj_heading,abs(MathHelper.get_angle_points(j[0],self.goal.copy(),j[0],j[0]+MathHelper.get_cartesian_coord(np.array((1,j[1]))))))
+                #eval_heading=(2*eval_heading-traj_heading)/3
+                
+                pos_list=[t[0] for t in traj]
+                nptraj=np.array(pos_list)
+                #assuming non-sized obstacles for now
+                D=cdist(npobs,nptraj)
+                min_D=np.min(D)
+                eval_dist=max(0,min(min_D-self.robot.size,self.obs_eval_bound))
+
+                #eval_dist=self.obs_eval_bound
+                #for i in self.obstacles:
+                #    for j in traj:
+                #        d = np.linalg.norm(j[0] - i.pos)
+                #        dist = max(0,d-self.robot.size-i.size)
+                #        eval_dist=min(eval_dist,dist)
+                #        if eval_dist==0:
+                #            break
+                #    if eval_dist==0:
+                #        break
+                
+                eval_vel=(last_state[2])
+                eval.append([turn,acc,eval_heading,eval_dist,eval_vel])
+                trajs.append(traj)
+                acc-=self.acc_res
+            turn-=self.turn_res
+        eval = np.array(eval)
+        if np.sum(eval[:, 2]) != 0:
+            eval[:, 2] = eval[:, 2] / np.sum(eval[:, 2])
+        if np.sum(eval[:, 3]) != 0:
+            eval[:, 3] = eval[:, 3] / np.sum(eval[:, 3])
+        if np.sum(eval[:, 4]) != 0:
+            eval[:, 4] = eval[:, 4] / np.sum(eval[:, 4])
+        factor = np.array([[1, 0, 0],[0, 1, 0],[0, 0, self.w_heading],[0, 0, self.w_obs],[0, 0, self.w_velocity]])
+        return [eval@factor,trajs]
+
+    def plan(self,dt:float,t:float):
+        """
+        Select the best predicted path.
+        """
+        dw=self.dynamic_window(dt)
+        eval_list=self.eval(dw,dt)
+        scores=eval_list[0][:,2]
+        best_path=np.argmax(scores)
+        self.cached_path=eval_list[1][best_path]
+        #scores=[row[2] for row in eval_list]
+        #eval_array=np.array(scores)
+        #best_path=np.argmax(eval_array)
+        #self.cached_path=eval_list[best_path][3]
+
+    def run(self, dt:float, t:float):
+        """
+        Plan and moves the robot.
+        """
+        s_t = time.process_time_ns()
+        if t>=self.t_start and self.reached[0] == False:
+            if self.goal_method == "lookahead":
+                self.goal_current = self.getLookaheadPoint()
+            else:
+                self.goal_current = self.goal
+        #semi_path=int((self.predict_time/dt)/2)
+        #if len(self.cached_path)<=semi_path:
+        #    self.cached_path=[]
+        #    self.plan(dt,t)
+        #if self.cached_path==[]:
+        #    self.plan(dt,t)
+        self.cached_path=[]
+        self.plan(dt,t)
+        todo=self.cached_path.pop(0)
+        self.robot.acc_engine=todo[5]
+        self.robot.wheel_acc=todo[6]
+        self.robot.update_wheel_angle(dt)
+        self.robot.update_velocity(dt)
+        self.robot.update_pos(dt)
+        e_t = time.process_time_ns()
+        self.comp_time += e_t - s_t
+        self.run_count += 1
+        #print([t,self.robot.pos.copy(),self.robot.theta,self.robot.speed_norm,self.robot.speed_angle, self.robot.velocity, self.robot.wheel_angle])
+        self.robot.history_pose.append([self.robot.pos.copy(),self.robot.theta,self.robot.speed_norm,self.robot.speed_angle, self.robot.velocity])
+
+#class MPC(LocalPlanner):
+#    def __init__(self,robot:BabyRobot, start, goal, env, obstacles, predict_time=1., time_step=0.1, **kwargs):
+#        super().__init__(robot, start, goal, env, obstacles, **kwargs)
+#        self.g_planner = GlobalStupid(start, goal, env)
+#        self.path = self.g_planner.run()
+#        self.predict_time=predict_time
+#        self.dt=0.1
+#        self.future_robot=self.robot.copy()
+#        self.steps=int(self.predict_time/self.dt)
+
+#    def template_model(self,symvar_type='SX'):
+#        model_type = 'continuous'  # either 'discrete' or 'continuous'
+#        model = do_mpc.model.Model(model_type, symvar_type)
+
+#        ## Certain parameters
+#        #m = 2.0  # Mass [kg]
+#        #lf = 0.3  # Distance from CoG to front wheel [m]
+#        #lr = 0.3  # Distance from CoG to rear wheel [m]
+#        #w = 0.15  # Width of the car [m]
+
+#        # States struct (optimization variables):
+#        X_p = model.set_variable(var_type='_x', var_name='X_p', shape=(1, 1))
+#        Y_p = model.set_variable(var_type='_x', var_name='Y_p', shape=(1, 1))
+#        Psi = model.set_variable(var_type='_x', var_name='Psi', shape=(1, 1))
+#        V = model.set_variable(var_type='_x', var_name='V', shape=(1, 1))
+
+#        # Input struct (optimization variables):
+#        Acc = model.set_variable(var_type='_u', var_name='Acc')
+#        Delta = model.set_variable(var_type='_u', var_name='Delta')
+        
+
+#        ## # Set expression. These can be used in the cost function, as non-linear constraints
+#        ## # or just to monitor another output.
+#        ## Expressions can also be formed without beeing explicitly added to the model.
+#        ## The main difference is that they will not be monitored and can only be used within the current file.
+#        #Beta = atan((lr / (lr + lf)) * tan(Delta))
+#        ## Differential equations
+#        #model.set_rhs('X_p', V * cos(Psi + Beta))
+#        #model.set_rhs('Y_p', V * sin(Psi + Beta))
+#        #model.set_rhs('Psi', (V / lr) * sin(Beta))
+#        #model.set_rhs('V', Acc)
+#        model.set_rhs('X_p', V * casadi.cos(Psi))
+#        model.set_rhs('Y_p', V * casadi.sin(Psi))
+#        model.set_rhs('Psi', (V * casadi.tan(Delta) / self.robot.size))
+#        model.set_rhs('V', Acc)
+
+#        # Build the model
+#        model.setup()
+
+#        # end of function
+#        return model
+
+#    def template_mpc(self, model, silence_solver=False):
+#        """
+#        template_mpc: tuning parameters
+#        """
+#        mpc = do_mpc.controller.MPC(model)
+
+#        # Set settings of MPC:
+#        mpc.settings.n_horizon = 1
+#        mpc.settings.n_robust = 0
+#        mpc.settings.open_loop = 0
+#        mpc.settings.t_step = 0.1
+#        mpc.settings.state_discretization = 'collocation'
+#        mpc.settings.collocation_type = 'radau'
+#        mpc.settings.collocation_deg = 2
+#        mpc.settings.collocation_ni = 1
+#        mpc.settings.store_full_solution = True
+
+#        # suppress solver output
+#        if silence_solver:
+#            mpc.settings.supress_ipopt_output()
+
+#        #pos_obs=[obs.pos for obs in self.obstacles]
+#        #npobs=np.array(pos_obs)
+#        #pos_list=[self.robot.pos]
+#        #nptraj=np.array(pos_list)
+#        ##assuming non-sized obstacles for now
+#        #D=cdist(npobs,nptraj)
+#        #min_D=np.min(D)
+#        #eval_dist=max(0,min(min_D-self.robot.size,self.obs_eval_bound))
+
+
+#        # setting up the cost function (trajectory tracking, the objective should not be the goal but the reference speed...)
+#        #mterm = (model.x['Y_p'] - 2) ** 2 + (model.x['X_p'] - 3) ** 2 + (model.x['Psi'] - 0) ** 2
+#        #lterm = ((model.x['Y_p'] - self.goal[1]) ** 2 + (model.x['Y_p'] - self.goal[1]) ** 2)
+#        mterm = ((model.x['X_p'] - self.goal[0]) ** 2 + (model.x['Y_p'] - self.goal[1]) ** 2)#-((model.x['X_p'] - self.obstacles[0].pos[0]) ** 2 + (model.x['Y_p'] - self.obstacles[0].pos[1]) ** 2)
+#        lterm = ((model.x['X_p'] - self.goal[0]) ** 2 + (model.x['Y_p'] - self.goal[1]) ** 2)-((model.x['X_p'] - self.obstacles[0].pos[0]) ** 2 + (model.x['Y_p'] - self.obstacles[0].pos[1]) ** 2)
+#        #((model.u['Delta'] - 0) ** 2 + (model.u['Acc'] - 0) ** 2)
+#        mpc.set_objective(mterm=mterm, lterm=lterm*0)
+
+#        # setting up the factors for input penalisation
+#        mpc.set_rterm(Delta=1.0, Acc=1.0)
+
+#        # setting up lower boundaries for the states
+#        mpc.bounds['lower', '_x', 'X_p'] = -50
+#        mpc.bounds['lower', '_x', 'Y_p'] = -50
+#        mpc.bounds['lower', '_x', 'Psi'] = -casadi.pi
+#        mpc.bounds['lower', '_x', 'V'] = self.robot.speed_min
+
+#        # setting up upper boundaries for the states
+#        mpc.bounds['upper', '_x', 'X_p'] = 50
+#        mpc.bounds['upper', '_x', 'Y_p'] = 50
+#        mpc.bounds['upper', '_x', 'Psi'] = casadi.pi
+#        mpc.bounds['upper', '_x', 'V'] = self.robot.speed_max
+
+#        # setting up lower boundaries for the inputs
+#        mpc.bounds['lower', '_u', 'Delta'] = -self.robot.wheel_acc_max
+#        mpc.bounds['lower', '_u', 'Acc'] = -self.robot.brake_max
+
+#        # setting up upper boundaries for the inputs
+#        mpc.bounds['upper', '_u', 'Delta'] = self.robot.wheel_acc_max
+#        mpc.bounds['upper', '_u', 'Acc'] = self.robot.acc_max
+
+#        # completing the setup of the mpc
+#        mpc.setup()
+
+#        # end of function
+#        return mpc
+
+#    def template_simulator(self, model):
+#        """
+#        template_optimizer: tuning parameters
+#        """
+#        simulator = do_mpc.simulator.Simulator(model)
+
+#        # setting up parameters for the simulator
+#        params_simulator = {
+#            'integration_tool': 'idas',#'cvodes',
+#            'abstol': 1e-10,
+#            'reltol': 1e-10,
+#            't_step': 0.1
+#        }
+#        simulator.set_param(**params_simulator)
+
+#        # setting up time varying parameters (tvp)
+#        tvp_num = simulator.get_tvp_template()
+#        def tvp_fun(t_now):
+#            return tvp_num
+#        simulator.set_tvp_fun(tvp_fun)
+
+#        # setting up parameters for the simulator
+#        p_num = simulator.get_p_template()
+#        def p_fun(t_now):
+#            return p_num
+#        simulator.set_p_fun(p_fun)
+
+#        # completing the simulator setup
+#        simulator.setup()
+
+#        # end of function
+#        return simulator
+
+#    def plan(self):
+#        # setting up the model
+#        model = self.template_model()
+
+#        # setting up a mpc controller, given the model
+#        mpc = self.template_mpc(model)
+
+#        # setting up a simulator, given the model
+#        simulator = self.template_simulator(model)
+
+#        # setting up an estimator, given the model
+#        estimator = do_mpc.estimator.StateFeedback(model)
+
+#        # Set the initial state of mpc and simulator:
+#        X_p_0 = float(self.robot.pos[0])  # Initial x position [m]
+#        Y_P_0 = float(self.robot.pos[1])  # Initial y position [m]
+#        Psi_0 = 0.#float(self.robot.wheel_angle)  # Intial yaw angle [rad]
+#        V  = float(self.robot.speed_norm)  # Initial velocity x-axis [m/s]
+#        x0 = np.array([X_p_0, Y_P_0, Psi_0, V]).reshape(-1, 1)
+
+#        # pushing initial condition to mpc and the simulator
+#        mpc.x0 = x0
+#        simulator.x0 = x0
+
+#        # setting up initial guesses
+#        mpc.set_initial_guess()
+
+#        optimal_control = []
+#        optimal_states = []
+#        optimal_states.append(x0)
+
+#        for k in range(self.steps):
+#            # for the current state x0, mpc computes the optimal control action u0
+#            u0 = mpc.make_step(x0)
+#            # for the current state u0, computes the next state y_next
+#            y_next = simulator.make_step(u0)
+#            # for the current state y_next, estimates the next state x0
+#            x0 = estimator.make_step(y_next)
+#            # storage
+#            optimal_control.append(u0)
+#            optimal_states.append(x0)
+
+#        return [optimal_control,optimal_states]
+
+#    def run(self,dt,t):
+#        s_t = time.process_time_ns()
+#        if t>=self.t_start and self.reached[0] == False:
+#            if self.goal_method == "lookahead":
+#                self.goal_current = self.getLookaheadPoint()
+#            else:
+#                self.goal_current = self.goal
+#        opt = self.plan()
+#        todo=opt[0][0]
+#        self.robot.acc_engine=float(todo[0])
+#        self.robot.wheel_acc=float(todo[1])
+#        self.robot.update_wheel_angle(dt)
+#        self.robot.update_velocity(dt)
+#        self.robot.update_pos(dt)
+#        e_t = time.process_time_ns()
+#        self.comp_time += e_t - s_t
+#        self.run_count += 1
+#        self.robot.history_pose.append([self.robot.pos.copy(),self.robot.theta,self.robot.speed_norm,self.robot.speed_angle, self.robot.velocity])
+
 #########################################################################################################################################################################################################
 #########################################################################################################################################################################################################        
 #SIMULATOR BELOW
@@ -2140,7 +2969,7 @@ class Simulator:
     """
     The main class that groups every agents and environment, and run the simulation.
     """
-    def __init__(self, env: Env, t_step: float, t_limit: float, prec: float):
+    def __init__(self, env: Env, t_step: float, t_limit: float, prec: float, ploting=True):
         """
         Create a Simulator.
         
@@ -2162,8 +2991,9 @@ class Simulator:
         self.agent_list = []
         self.env = env
         self.t_step = t_step
-        self.plot = Plot(env)
-        #TEMPORARY COMMENT TO RUN THE BENCHMARK
+        self.plot=None
+        if ploting:
+            self.plot = Plot(env)
         self.t = 0.
         self.t_limit = t_limit
         self.prec = prec
@@ -2178,8 +3008,8 @@ class Simulator:
         ----------
         """
         self.agent_list.append(agent)
-        self.plot.add_agent(agent)
-        #TEMPORARY COMMENT TO RUN THE BENCHMARK
+        if self.plot is not None:
+            self.plot.add_agent(agent)
 
     def __call__(self, *planner_list):
         """
@@ -2224,16 +3054,18 @@ class Simulator:
         while (not(agent.planner.reached[0]) and (agent.planner.nb_collision == [0,[]]) and self.t < self.t_limit):
             all_reach = True
             for i in self.agent_list:
-                i.planner.run(dt, self.t)
-                i.planner.collision_detection()
-                if not(i.planner.reached[0]):
-                    if np.linalg.norm(np.array(i.planner.robot.pos) - np.array(i.planner.goal)) < self.prec:
-                        i.planner.reached = (True, self.t)
-                    #if i.planner.reached == (False,0):
-                    #    all_reach = False
+                if not(i.planner.reached[0]) and i.planner.nb_collision[0]==0:
+                    i.planner.run(dt, self.t)
+                    i.planner.collision_detection()
+                    if not(i.planner.reached[0]):
+                        if np.linalg.norm(np.array(i.planner.robot.pos) - np.array(i.planner.goal)) < self.prec:
+                            i.planner.reached = (True, self.t)
             self.t += dt
             
     def avoid_overlap(self,obs_lists):
+        """
+        at initialization, avoid overlap between obstacles and agents (being themselves obstacles).
+        """
         overlap = True
         move_buffer = []
         obss = []
@@ -2337,7 +3169,7 @@ class Simulator:
             f.write(str(i) + '       \n')
         for i in self.agent_list:
             f.write(i.robot.name + ": start " + str(i.planner.start) + ", goal " + str(i.planner.goal) + ", parameters: " + 
-                    str(i.robot.max_speed) + ", " + str(i.planner.k_attr) + ", " + str(i.planner.k_rep) + ", " + str(i.planner.k_dist)
+                    str(i.robot.speed_max) + ", " + str(i.planner.k_attr) + ", " + str(i.planner.k_rep) + ", " + str(i.planner.k_dist)
                     + "\\\\ \n" + "path length: " + str(i.path_length) + "\\\\ \n" + "sum angles: " + str(i.sum_angle) + "\\\\ \n" + "time to reach goal: " + str(i.time_to_reach_goal) + "\\\\ \n" + "additional obstacles: ")
         for i in self.agent_list:
             pobs=i.planner.obstacles.copy()
@@ -2367,6 +3199,9 @@ class Simulator:
 class Map_Designer:
     @staticmethod
     def make_u(length, width, pos, density, file):
+        """
+        Create a U-shape.
+        """
         f = open(file, 'w', encoding = "utf-8")
         f.write("Environment:\n")
         my_obs = np.array(pos)
@@ -2383,6 +3218,9 @@ class Map_Designer:
 
     @staticmethod
     def make_v(length, width, pos, density, file):
+        """
+        Create a V-shape.
+        """
         f = open(file, 'w', encoding = "utf-8")
         f.write("Environment:\n")
         my_obs = np.array(pos)
@@ -2399,14 +3237,18 @@ class Map_Designer:
 
     @staticmethod
     def make_poly_line(pos_list,density,file,theta = 0):
+        """
+        Create a multiples connected lines.
+        """
+        #make set of lines when corners are the points in the list pos_list
         f = open(file, 'w', encoding = "utf-8")
         f.write("Environment:\n")
         points = []
         meanpoint = np.array((0.,0.))
         for i in range(len(pos_list)-1):
             p = np.array(pos_list[i])
-            points.append(p.copy())
-            meanpoint+=points[-1]
+            #points.append(p.copy())
+            #meanpoint+=points[-1]
             q = np.array(pos_list[i+1])
             (d,alpha) = MathHelper.get_polar_coord(q-p)
             j = 0
@@ -2434,7 +3276,10 @@ class Map_Designer:
         f.close()
 
     @staticmethod
-    def make_ellipse(length, width, center, paramt, file, theta = 0):
+    def make_ellipse2(length, width, center, paramt, file, theta = 0):
+        """
+        Create a semi-ellipse. DEPRECATED (unequal density)
+        """
         f = open(file, 'w', encoding = "utf-8")
         f.write("Environment:\n")
         my_obs = np.array(center)
@@ -2446,6 +3291,55 @@ class Map_Designer:
             #f.write("(" + str(my_obs[0]+length*math.cos(i)) + "," + str(my_obs[1]+width*math.sin(i)) + ")\n")
             #f.write("(" + str(my_obs[0]+length*math.cos(i))+ "," + str(my_obs[1]-width*math.sin(i)) + ")\n")
             i+=paramt
+        rtheta = np.array(((math.cos(theta),-math.sin(theta)),(math.sin(theta),math.cos(theta))))
+        npoints = []
+        if theta!=0:
+            for i in points:
+                npoints.append(rtheta@(i-center)+center)
+            for i in npoints:
+                f.write("(" + str(i[0]) + "," + str(i[1]) + ")\n")
+        else:
+            for i in points:
+                f.write("(" + str(i[0]) + "," + str(i[1]) + ")\n")
+        f.close()
+
+    @staticmethod
+    def make_ellipse(length, width, center, paramt, file, theta = 0):
+        """
+        Create a semi-ellipse.
+        """
+        f = open(file, 'w', encoding = "utf-8")
+        f.write("Environment:\n")
+        my_obs = np.array(center)
+        points = []
+        i=0
+        while i < math.pi/2:
+            points.append(np.array((my_obs[0]+length*math.cos(i),my_obs[1]+width*math.sin(i))))
+            points.append(np.array((my_obs[0]+length*math.cos(i),my_obs[1]-width*math.sin(i))))
+
+            #searching for the increment to get the next point at paramt distance
+            a=(4*(length**2)*(math.cos(i)**2)+4*(width**2)*(math.sin(i)**2)-paramt**2)
+            b=(8*(length**2)*math.cos(i)*math.sin(i)-8*(width**2)*math.cos(i)*math.sin(i))
+            c=(4*(length**2)*(math.sin(i)**2)+4*(width**2)*(math.cos(i)**2)-2*(paramt**2))
+            d=0
+            e=-(paramt**2)
+            pol=np.array((a,b,c,d,e))#a polinomial in tan((increment)/2)
+            sol=np.roots(pol)
+            soli=np.imag(sol)
+            l=[]
+            for n in range(len(soli)):
+                if soli[n]==0:
+                    l.append(np.real(sol[n]))
+            m=[]
+            for k in l:
+                k=2*math.atan(k)#restauring the increment
+                m.append(k)
+            positive=[]
+            for k in m:
+                if k>0:
+                    positive.append(k)
+            s=min(positive)
+            i+=s
         rtheta = np.array(((math.cos(theta),-math.sin(theta)),(math.sin(theta),math.cos(theta))))
         npoints = []
         if theta!=0:
@@ -2630,68 +3524,152 @@ def main():
     The main function for running the simulator, save and plot the results.
     """
     start_computation_time = time.process_time_ns()
-    #file = "tests/dt01_s_ushape_5.txt"
-    file = "F:/pathplanner1/pathplanner/tests/benchmarku8w/u8w00000001.txt"
+    #file = "C:/Users/desoe/source/repos/pathplanner/pathplanner/tests/t02_s_1nfront_1.txt"
+    #file = "C:/Users/desoe/source/repos/pathplanner/pathplanner/tests/testellipse.txt"
+    #file = "C:/Users/desoe/source/repos/pathplanner/pathplanner/tests/dt03_s_maze_1.txt"
+    #file = "F:/Benchmarks/pathplannerwallc/pathplanner/tests/benchmark/wall00000001.txt"
+    file= "F:/Benchmarks/pathplannerdynadt/pathplanner/tests/benchmarkd/dyna00000196.txt"
+    #file = "F:/Benchmarks/pathplannerwdwa/pathplanner/tests/benchmark/wall00000003.txt"
+    #Map_Designer.make_ellipse(6,3,np.array((10,0)),0.1,file,0)
     file_split = file.split('.')
     env_init = Grid(20,5,file)
-    start = np.array((0.,0.))
-    #start0 = np.array((0.,0.5))
-    #startl = np.array((-5.,0.))
-    #startb = np.array((0.,-5.))
-    goal = np.array((20.,0.))
-    #goal0 = np.array((10.,0.5))
-    #goaltop = np.array((10.,3.))
+    #start = np.array((0.,0.))
+    #goal = np.array((20.,0.))
+    start = np.array((2.,1.))
+    goal = np.array((18.,9.))
     env = Map(20,5)
     env.from_grid_to_map(env_init, 0.)
 
-    obstacles = env.obs_circ#tacles
+    obstacles = env.obs_circ
 
-    #classic1r = BabyRobot(start.copy(),0,1,0,1,0.,"classic1")
-    #classic1 = Robot(classic1r)
-    #classic1plan = FAPF(classic1.robot, classic1.robot.pos.copy(), goal.copy(), env, obstacles, 1., 1., 2., color_trace = (1,0,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-    #classic1.set_planner(classic1plan)
-    #tangential1r = BabyRobot(start.copy(),0,1,0,1,0.,"tangential1")
-    #tangential1 = Robot(tangential1r)
-    #tangential1plan = FAPF(tangential1.robot, tangential1.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (0,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-    #tangential1.set_planner(tangential1plan)
-    #iner1r = BabyRobot(start.copy(),0,1,0,1,0.,"inertial1")
-    #iner1 = Robot(iner1r)
-    #iner1plan = FAPF(iner1.robot, iner1.robot.pos.copy(), goal.copy(), env, obstacles, 1., 1., 2., color_trace = (0,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-    #iner1.set_planner(iner1plan)
-    #taniner1r = BabyRobot(start.copy(),0,1,0,1,0.,"tangentialinertial1")
-    #taniner1 = Robot(taniner1r)
-    #taniner1plan = FAPF(taniner1.robot, taniner1.robot.pos.copy(), goal.copy(), env, obstacles, 1., 1., 2., color_trace = (0,0,0), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-    #taniner1.set_planner(taniner1plan)
-    #dtangential1r = BabyRobot(start.copy(),0,1,0,1,0.1,"dtangential1")
-    #dtangential1 = Robot(dtangential1r)
-    #dtangential1plan = FDAPF(dtangential1.robot, dtangential1.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (1,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-    ##dtangential1plan = FAPF(dtangential1.robot, dtangential1.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (1,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-    #dtangential1.set_planner(dtangential1plan)
-    ditbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dit")
+    ditbr = BabyRobot(start.copy(),-math.pi/2,1.,-math.pi/2,1.,0.1,"dit",5.,5.,math.pi/4,-1.)
     ditr = Robot(ditbr)
-    ditrplan = FDAPF(ditr.robot, ditr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (0.3,0.3,0.3), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+    ditrplan = FDAPF(ditr.robot, ditr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (0.3,0.3,0.3), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+    #ditrplan = FAPF(ditr.robot, ditr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (0.3,0.3,0.3), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+    #ditrplan = DWA(ditr.robot, ditr.robot.pos.copy(),goal.copy(),env,obstacles.copy())
+    #ditrplan = MPC(ditr.robot, ditr.robot.pos.copy(),goal.copy(),env,obstacles.copy())
     ditr.set_planner(ditrplan)
 
     simulator = Simulator(env,0.1,60,0.1)
-    #simulator.add_agent(classic1)
-    #simulator.add_agent(tangential1)
-    #simulator.add_agent(dtangential1)
     simulator.add_agent(ditr)
-    #simulator.add_agent(iner1)
-    #simulator.add_agent(taniner1)
 
-    #simulator.run2(dtangential1)
     simulator.run2(ditr)
     simulator.compute_data()
     simulator.print_data()
-    simulator.save_data(file_split[0]+"_out."+file_split[1])
-    simulator.save_data_latex(file_split[0]+"_out.tex")
+    #simulator.save_data(file_split[0]+"_out."+file_split[1])
+    #simulator.save_data_latex(file_split[0]+"_out.tex")
     end_computation_time = time.process_time_ns()
     print("Computation time: ", end_computation_time - start_computation_time)
     print(str(file) + ';' + str(ditr.path_length) + ';' + str(ditr.sum_angle[0]) + ';' + str(ditr.sum_angle[1]) + ';' + str(ditr.sum_angle[2]) 
           + ';' + str(ditr.max_angle) + ';' + str(ditr.time_to_reach_goal) + ';' + str(ditr.planner.comp_time) + ';' + str(ditr.planner.nb_collision[0]) + '\n')
     simulator.plot.animate("test")
     
+def mainbis():
+    """
+    The main function for running the simulator, save and plot the results.
+    """
+    #start_computation_time = time.process_time_ns()
+    file = "F:/pathplannerv5/pathplanner/tests/benchmarkv2w/v2w00006890.txt"
+    file_split = file.split('.')
+    env_init = Grid(20,5,file)
+    start = np.array((0.,0.))
+    goal = np.array((20.,0.))
+    env = Map(20,5)
+    env.from_grid_to_map(env_init, 0.)
+    prec = 0.1
+    t_lim = 60
+    t_step = 0.1
+
+    obstacles = env.obs_circ
+
+    cbr = BabyRobot(start.copy(),0,1,0,1,0.1,"cr")
+    cr = Robot(cbr)
+    crplan = FAPF(cr.robot, cr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (1,0,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+    cr.set_planner(crplan)
+
+    tbr = BabyRobot(start.copy(),0,1,0,1,0.1,"tr")
+    tr = Robot(tbr)
+    trplan = FAPF(tr.robot, tr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (0,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+    tr.set_planner(trplan)
+
+    ibr = BabyRobot(start.copy(),0,1,0,1,0.1,"ir")
+    ir = Robot(ibr)
+    irplan = FAPF(ir.robot, ir.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (0,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+    ir.set_planner(irplan)
+
+    itbr = BabyRobot(start.copy(),0,1,0,1,0.1,"itr")
+    itr = Robot(itbr)
+    itrplan = FAPF(itr.robot, itr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (1,1,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+    itr.set_planner(itrplan)
+
+    dcbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dc")
+    dcr = Robot(dcbr)
+    dcrplan = FDAPF(dcr.robot, dcr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (0,1,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+    dcr.set_planner(dcrplan)
+
+    dtbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dt")
+    dtr = Robot(dtbr)
+    dtrplan = FDAPF(dtr.robot, dtr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (1,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+    dtr.set_planner(dtrplan)
+
+    dibr = BabyRobot(start.copy(),0,1,0,1,0.1,"di")
+    dir = Robot(dibr)
+    dirplan = FDAPF(dir.robot, dir.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (1,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+    dir.set_planner(dirplan)
+
+    ditbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dit")
+    ditr = Robot(ditbr)
+    ditrplan = FDAPF(ditr.robot, ditr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (0.3,0.3,0.3), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+    ditr.set_planner(ditrplan)
+
+    sc = Simulator(env,t_step,t_lim,prec)
+    sc.add_agent(cr)
+    sc.run2(cr)
+    sc.compute_data()
+    sc.save_data_latex(file_split[0]+"_out_c.tex")
+
+    st = Simulator(env,t_step,t_lim,prec)
+    st.add_agent(tr)
+    st.run2(tr)
+    st.compute_data()
+    st.save_data_latex(file_split[0]+"_out_t.tex")
+
+    si = Simulator(env,t_step,t_lim,prec)
+    si.add_agent(ir)
+    si.run2(ir)
+    si.compute_data()
+    si.save_data_latex(file_split[0]+"_out_i.tex")
+
+    sit = Simulator(env,t_step,t_lim,prec)
+    sit.add_agent(itr)
+    sit.run2(itr)
+    sit.compute_data()
+    sit.save_data_latex(file_split[0]+"_out_it.tex")
+
+    sdc = Simulator(env,t_step,t_lim,prec)
+    sdc.add_agent(dcr)
+    sdc.run2(dcr)
+    sdc.compute_data()
+    sdc.save_data_latex(file_split[0]+"_out_dc.tex")
+
+    sdt = Simulator(env,t_step,t_lim,prec)
+    sdt.add_agent(dtr)
+    sdt.run2(dtr)
+    sdt.compute_data()
+    sdt.save_data_latex(file_split[0]+"_out_dt.tex")
+
+    sdi = Simulator(env,t_step,t_lim,prec)
+    sdi.add_agent(dir)
+    sdi.run2(dir)
+    sdi.compute_data()
+    sdi.save_data_latex(file_split[0]+"_out_di.tex")
+
+    sdit = Simulator(env,t_step,t_lim,prec)
+    sdit.add_agent(ditr)
+    sdit.run2(ditr)
+    sdit.compute_data()
+    sdit.save_data_latex(file_split[0]+"_out_dit.tex")
+
 
 def main2():
     """
@@ -2730,50 +3708,70 @@ def main2():
     print("results: ", results)
 
 def main3():
+    """
+    main function for running the random script with plots.
+    """
     start_computation_time = time.process_time_ns()
-    rnggen = np.random.RandomState(849)
-    rngsim = np.random.RandomState(564564)
-    file = "tests/benchmark/0001.txt"
+    rnggen = np.random.RandomState(196)
+    rngsim = np.random.RandomState(196)
+    file = "tests/emptyrandom_0001.txt"
     file_split = file.split('.')
     x = 20
-    y = 5
-    Grid.write_random_env(file,x,y,20,rnggen)
-    env = Grid(x,y,file)
-    start = np.array((0.,1.))
-    goal = np.array((10.,1.))
+    y = 10
+    Grid.write_random_env(file,x,y,80,rnggen)
+    env_init = Grid(x,y,file)
+    env = Map(20,5)
+    env.from_grid_to_map(env_init, 0.)
+    obs = env.obs_circ
+    start = np.array((2.,1.))
+    goal = np.array((18.,9.))
+    prec = 0.1
+    t_lim = 60
+    t_step = 0.1
+
     random_robots_list = []
     random_agents_list = []
     random_planner_list = []
     apf_robots_list = []
     apf_agents_list = []
     apf_planner_list = []
-    starts_ends = rnggen.random_sample((30,2))
-    for i in range(30):
+    #generate starting and ending points for moving obstacles
+    starts_ends = rnggen.random_sample((40,2))
+    for i in range(40):
         starts_ends[i][0] = x*starts_ends[i][0]
         starts_ends[i][1] = y*starts_ends[i][1]
-    obstacles = env.obstacles.copy()
-    simulator = Simulator(env,0.05,40,0.1)
+    obstacles = env.obs_circ.copy()
+    simulator = Simulator(env,t_step,t_lim,prec)
     for i in range(0,10):
-        random_robots_list.append(BabyRobot(starts_ends[i].copy(),0,0,0,1,0,"r"+str(i)))
+        BabyRobot(start.copy(),0,1,0,1,0.1,"cr",5.,5.,math.pi/4,-1.)
+        random_robots_list.append(BabyRobot(starts_ends[i].copy(),0,0,0,1,0.1,"r"+str(i),5.,5.,math.pi,-1,10*math.pi))#useless params after name
         random_agents_list.append(Robot(random_robots_list[i]))
-        random_planner_list.append(InputPlanner(random_agents_list[i].robot,starts_ends[i].copy(),starts_ends[i+15].copy(),env,env.obstacles.copy(),0,0,acts_on_speed=True, rng=rngsim))
+        random_planner_list.append(InputPlanner(random_agents_list[i].robot,starts_ends[i].copy(),starts_ends[i+20].copy(),env,obs.copy(),0,0,acts_on_speed=True, rng=rngsim))
         random_agents_list[i].set_planner(random_planner_list[i])
-        obstacles.append(random_robots_list[i].pos)
+        obstacles.append(random_robots_list[i])
         simulator.add_agent(random_agents_list[i])
-    for i in range(10,15):
-        apf_robots_list.append(BabyRobot(starts_ends[i].copy(),0,0,0,1,0,"a"+str(i-10)))
+    for i in range(10,20):
+        apf_robots_list.append(BabyRobot(starts_ends[i].copy(),0,0,0,1,0.1,"a"+str(i-10),5.,5.,math.pi/4,-1.))
         apf_agents_list.append(Robot(apf_robots_list[i-10]))
-        apf_planner_list.append(FDAPF(apf_agents_list[i-10].robot, starts_ends[i].copy(), starts_ends[i+15].copy(), env, env.obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (1,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi))
+        apf_planner_list.append(FAPF(apf_agents_list[i-10].robot, starts_ends[i].copy(), starts_ends[i+20].copy(), env, obs.copy(), 1., 1., 2., color_trace = (1,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi))
         apf_agents_list[i-10].set_planner(apf_planner_list[i-10])
-        obstacles.append(apf_robots_list[i-10].pos)
+        obstacles.append(apf_robots_list[i-10])
         simulator.add_agent(apf_agents_list[i-10])
-    dtangential1r = BabyRobot(start.copy(),0,1,0,1,0.,"dtangential1")
+    #all agents avoid other agents but not themselves (and not the observed robot)
+    for i in range(10):
+        obsi=obstacles.copy()
+        obsi.remove(apf_robots_list[i])
+        apf_planner_list[i].update_obstacles(obsi.copy())
+    #the observed robot
+    dtangential1r = BabyRobot(start.copy(),0,1,0,1,0.1,"dtangential1",5.,5.,math.pi/4,-1.)
     dtangential1 = Robot(dtangential1r)
     dtangential1plan = FDAPF(dtangential1.robot, dtangential1.robot.pos.copy(), goal.copy(), env, obstacles, 1., 4., 0.2, 1., 2., 4., color_trace = (0,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+    #dtangential1plan = FAPF(dtangential1.robot, dtangential1.robot.pos.copy(), goal.copy(), env, obstacles, 1., 1., 2., color_trace = (0,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+    #dtangential1plan = DWA(dtangential1.robot, dtangential1.robot.pos.copy(), goal.copy(), env, obstacles, color_trace = (0,1,0))
     dtangential1.set_planner(dtangential1plan)
     simulator.add_agent(dtangential1)
 
-    simulator.run()
+    simulator.run2(dtangential1)
     simulator.compute_data()
     simulator.print_data()
     end_computation_time = time.process_time_ns()
@@ -2783,6 +3781,9 @@ def main3():
     simulator.plot.animate("test")
 
 def main4():
+    """
+    old script for random.
+    """
     start_computation_time = time.process_time_ns()
     rnggen = np.random.RandomState(849)
     rngsim = np.random.RandomState(564564)
@@ -2844,6 +3845,9 @@ def main4():
     simulator.plot.animate("test")
 
 def main5():
+    """
+    wall benchmark, commented part are used to run it on multiple CPU.
+    """
     lrpos = [0.05,0.2,0.5,0.8,0.95] #obstacle on left-right percentage
     btpos = [0.,-0.25,0.25] #obstacle on bot-top percentage
     dec = [0.,0.05] #broke symetry from on point in 0.1 to one in 0.05 and 0.15 (point to door)
@@ -2859,45 +3863,50 @@ def main5():
     t_lim = 60
     t_step = 0.1
 
-    filec = "tests/benchmark/wallc.txt"
-    fc = open(filec, 'w', encoding = "utf-8")
-    fc.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fc.close()
+    #filec = "tests/benchmark/wallc.txt"
+    #fc = open(filec, 'w', encoding = "utf-8")
+    #fc.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fc.close()
 
-    filet = "tests/benchmark/wallt.txt"
-    ft = open(filet, 'w', encoding = "utf-8")
-    ft.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    ft.close()
+    #filet = "tests/benchmark/wallt.txt"
+    #ft = open(filet, 'w', encoding = "utf-8")
+    #ft.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #ft.close()
 
-    filei = "tests/benchmark/walli.txt"
-    fi = open(filei, 'w', encoding = "utf-8")
-    fi.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fi.close()
+    #filei = "tests/benchmark/walli.txt"
+    #fi = open(filei, 'w', encoding = "utf-8")
+    #fi.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fi.close()
 
-    fileit = "tests/benchmark/wallit.txt"
-    fit = open(fileit, 'w', encoding = "utf-8")
-    fit.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fit.close()
+    #fileit = "tests/benchmark/wallit.txt"
+    #fit = open(fileit, 'w', encoding = "utf-8")
+    #fit.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fit.close()
 
-    filedc = "tests/benchmark/walldc.txt"
-    fdc = open(filedc, 'w', encoding = "utf-8")
-    fdc.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fdc.close()
+    #filedc = "tests/benchmark/walldc.txt"
+    #fdc = open(filedc, 'w', encoding = "utf-8")
+    #fdc.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdc.close()
 
-    filedt = "tests/benchmark/walldt.txt"
-    fdt = open(filedt, 'w', encoding = "utf-8")
-    fdt.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fdt.close()
+    #filedt = "tests/benchmark/walldt.txt"
+    #fdt = open(filedt, 'w', encoding = "utf-8")
+    #fdt.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdt.close()
 
-    filedi = "tests/benchmark/walldi.txt"
-    fdi = open(filedi, 'w', encoding = "utf-8")
-    fdi.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fdi.close()
+    #filedi = "tests/benchmark/walldi.txt"
+    #fdi = open(filedi, 'w', encoding = "utf-8")
+    #fdi.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdi.close()
 
-    filedit = "tests/benchmark/walldit.txt"
-    fdit = open(filedit, 'w', encoding = "utf-8")
-    fdit.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fdit.close()
+    #filedit = "tests/benchmark/walldit.txt"
+    #fdit = open(filedit, 'w', encoding = "utf-8")
+    #fdit.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdit.close()
+
+    filedwa = "tests/benchmark/walldwa.txt"
+    fdwa = open(filedwa, 'w', encoding = "utf-8")
+    fdwa.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    fdwa.close()
 
     #walls
     for a in range(len(ls)):
@@ -2919,113 +3928,129 @@ def main5():
                         env.from_grid_to_map(env_init, 0.)
                         obstacles = env.obs_circ
 
-                        cbr = BabyRobot(start.copy(),0,1,0,1,0.1,"cr")
-                        cr = Robot(cbr)
-                        crplan = FAPF(cr.robot, cr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (1,0,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                        cr.set_planner(crplan)
-                        sc = Simulator(env,t_step,t_lim,prec)
-                        sc.add_agent(cr)
-                        sc.run2(cr)
-                        sc.compute_data()
-                        fc = open(filec, 'a', encoding = "utf-8")
-                        fc.write(str(file) + ';' + str(cr.path_length) + ';' + str(cr.sum_angle[0]) + ';' + str(cr.sum_angle[1]) + ';' + str(cr.sum_angle[2]) 
-                                 + ';' + str(cr.max_angle) + ';' + str(cr.time_to_reach_goal) + ';' + str(cr.planner.comp_time) + ';' + str(cr.planner.nb_collision[0]) + '\n')
-                        fc.close()
+                        #cbr = BabyRobot(start.copy(),0,1,0,1,0.1,"cr",5.,5.,math.pi/4,-1.)
+                        #cr = Robot(cbr)
+                        #crplan = FAPF(cr.robot, cr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (1,0,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                        #cr.set_planner(crplan)
+                        #sc = Simulator(env,t_step,t_lim,prec,ploting=False)
+                        #sc.add_agent(cr)
+                        #sc.run2(cr)
+                        #sc.compute_data()
+                        #fc = open(filec, 'a', encoding = "utf-8")
+                        #fc.write(str(file) + ';' + str(cr.path_length) + ';' + str(cr.sum_angle[0]) + ';' + str(cr.sum_angle[1]) + ';' + str(cr.sum_angle[2]) 
+                        #         + ';' + str(cr.max_angle) + ';' + str(cr.time_to_reach_goal) + ';' + str(cr.planner.comp_time) + ';' + str(cr.planner.nb_collision[0]) + '\n')
+                        #fc.close()
 
-                        tbr = BabyRobot(start.copy(),0,1,0,1,0.1,"tr")
-                        tr = Robot(tbr)
-                        trplan = FAPF(tr.robot, tr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (0,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                        tr.set_planner(trplan)
-                        st = Simulator(env,t_step,t_lim,prec)
-                        st.add_agent(tr)
-                        st.run2(tr)
-                        st.compute_data()
-                        ft = open(filet, 'a', encoding = "utf-8")
-                        ft.write(str(file) + ';' + str(tr.path_length) + ';' + str(tr.sum_angle[0]) + ';' + str(tr.sum_angle[1]) + ';' + str(tr.sum_angle[2]) 
-                                 + ';' + str(tr.max_angle) + ';' + str(tr.time_to_reach_goal) + ';' + str(tr.planner.comp_time) + ';' + str(tr.planner.nb_collision[0]) + '\n')
-                        ft.close()
+                        #tbr = BabyRobot(start.copy(),0,1,0,1,0.1,"tr",5.,5.,math.pi/4,-1.)
+                        #tr = Robot(tbr)
+                        #trplan = FAPF(tr.robot, tr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (0,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                        #tr.set_planner(trplan)
+                        #st = Simulator(env,t_step,t_lim,prec,ploting=False)
+                        #st.add_agent(tr)
+                        #st.run2(tr)
+                        #st.compute_data()
+                        #ft = open(filet, 'a', encoding = "utf-8")
+                        #ft.write(str(file) + ';' + str(tr.path_length) + ';' + str(tr.sum_angle[0]) + ';' + str(tr.sum_angle[1]) + ';' + str(tr.sum_angle[2]) 
+                        #         + ';' + str(tr.max_angle) + ';' + str(tr.time_to_reach_goal) + ';' + str(tr.planner.comp_time) + ';' + str(tr.planner.nb_collision[0]) + '\n')
+                        #ft.close()
 
-                        ibr = BabyRobot(start.copy(),0,1,0,1,0.1,"ir")
-                        ir = Robot(ibr)
-                        irplan = FAPF(ir.robot, ir.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (0,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                        ir.set_planner(irplan)
-                        si = Simulator(env,t_step,t_lim,prec)
-                        si.add_agent(ir)
-                        si.run2(ir)
-                        si.compute_data()
-                        fi = open(filei, 'a', encoding = "utf-8")
-                        fi.write(str(file) + ';' + str(ir.path_length) + ';' + str(ir.sum_angle[0]) + ';' + str(ir.sum_angle[1]) + ';' + str(ir.sum_angle[2]) 
-                                 + ';' + str(ir.max_angle) + ';' + str(ir.time_to_reach_goal) + ';' + str(ir.planner.comp_time) + ';' + str(ir.planner.nb_collision[0]) + '\n')
-                        fi.close()
+                        #ibr = BabyRobot(start.copy(),0,1,0,1,0.1,"ir",5.,5.,math.pi/4,-1.)
+                        #ir = Robot(ibr)
+                        #irplan = FAPF(ir.robot, ir.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (0,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                        #ir.set_planner(irplan)
+                        #si = Simulator(env,t_step,t_lim,prec,ploting=False)
+                        #si.add_agent(ir)
+                        #si.run2(ir)
+                        #si.compute_data()
+                        #fi = open(filei, 'a', encoding = "utf-8")
+                        #fi.write(str(file) + ';' + str(ir.path_length) + ';' + str(ir.sum_angle[0]) + ';' + str(ir.sum_angle[1]) + ';' + str(ir.sum_angle[2]) 
+                        #         + ';' + str(ir.max_angle) + ';' + str(ir.time_to_reach_goal) + ';' + str(ir.planner.comp_time) + ';' + str(ir.planner.nb_collision[0]) + '\n')
+                        #fi.close()
 
-                        itbr = BabyRobot(start.copy(),0,1,0,1,0.1,"itr")
-                        itr = Robot(itbr)
-                        itrplan = FAPF(itr.robot, itr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (1,1,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                        itr.set_planner(itrplan)
-                        sit = Simulator(env,t_step,t_lim,prec)
-                        sit.add_agent(itr)
-                        sit.run2(itr)
-                        sit.compute_data()
-                        fit = open(fileit, 'a', encoding = "utf-8")
-                        fit.write(str(file) + ';' + str(itr.path_length) + ';' + str(itr.sum_angle[0]) + ';' + str(itr.sum_angle[1]) + ';' + str(itr.sum_angle[2]) 
-                                 + ';' + str(itr.max_angle) + ';' + str(itr.time_to_reach_goal) + ';' + str(itr.planner.comp_time) + ';' + str(itr.planner.nb_collision[0]) + '\n')
-                        fit.close()
+                        #itbr = BabyRobot(start.copy(),0,1,0,1,0.1,"itr",5.,5.,math.pi/4,-1.)
+                        #itr = Robot(itbr)
+                        #itrplan = FAPF(itr.robot, itr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (1,1,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                        #itr.set_planner(itrplan)
+                        #sit = Simulator(env,t_step,t_lim,prec,ploting=False)
+                        #sit.add_agent(itr)
+                        #sit.run2(itr)
+                        #sit.compute_data()
+                        #fit = open(fileit, 'a', encoding = "utf-8")
+                        #fit.write(str(file) + ';' + str(itr.path_length) + ';' + str(itr.sum_angle[0]) + ';' + str(itr.sum_angle[1]) + ';' + str(itr.sum_angle[2]) 
+                        #         + ';' + str(itr.max_angle) + ';' + str(itr.time_to_reach_goal) + ';' + str(itr.planner.comp_time) + ';' + str(itr.planner.nb_collision[0]) + '\n')
+                        #fit.close()
 
-                        dcbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dc")
-                        dcr = Robot(dcbr)
-                        dcrplan = FDAPF(dcr.robot, dcr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (0,1,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                        dcr.set_planner(dcrplan)
-                        sdc = Simulator(env,t_step,t_lim,prec)
-                        sdc.add_agent(dcr)
-                        sdc.run2(dcr)
-                        sdc.compute_data()
-                        fdc = open(filedc, 'a', encoding = "utf-8")
-                        fdc.write(str(file) + ';' + str(dcr.path_length) + ';' + str(dcr.sum_angle[0]) + ';' + str(dcr.sum_angle[1]) + ';' + str(dcr.sum_angle[2]) 
-                                 + ';' + str(dcr.max_angle) + ';' + str(dcr.time_to_reach_goal) + ';' + str(dcr.planner.comp_time) + ';' + str(dcr.planner.nb_collision[0]) + '\n')
-                        fdc.close()
+                        #dcbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dc",5.,5.,math.pi/4,-1.)
+                        #dcr = Robot(dcbr)
+                        #dcrplan = FDAPF(dcr.robot, dcr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (0,1,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                        #dcr.set_planner(dcrplan)
+                        #sdc = Simulator(env,t_step,t_lim,prec,ploting=False)
+                        #sdc.add_agent(dcr)
+                        #sdc.run2(dcr)
+                        #sdc.compute_data()
+                        #fdc = open(filedc, 'a', encoding = "utf-8")
+                        #fdc.write(str(file) + ';' + str(dcr.path_length) + ';' + str(dcr.sum_angle[0]) + ';' + str(dcr.sum_angle[1]) + ';' + str(dcr.sum_angle[2]) 
+                        #         + ';' + str(dcr.max_angle) + ';' + str(dcr.time_to_reach_goal) + ';' + str(dcr.planner.comp_time) + ';' + str(dcr.planner.nb_collision[0]) + '\n')
+                        #fdc.close()
 
-                        dtbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dt")
-                        dtr = Robot(dtbr)
-                        dtrplan = FDAPF(dtr.robot, dtr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (1,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                        dtr.set_planner(dtrplan)
-                        sdt = Simulator(env,t_step,t_lim,prec)
-                        sdt.add_agent(dtr)
-                        sdt.run2(dtr)
-                        sdt.compute_data()
-                        fdt = open(filedt, 'a', encoding = "utf-8")
-                        fdt.write(str(file) + ';' + str(dtr.path_length) + ';' + str(dtr.sum_angle[0]) + ';' + str(dtr.sum_angle[1]) + ';' + str(dtr.sum_angle[2]) 
-                                 + ';' + str(dtr.max_angle) + ';' + str(dtr.time_to_reach_goal) + ';' + str(dtr.planner.comp_time) + ';' + str(dtr.planner.nb_collision[0]) + '\n')
-                        fdt.close()
+                        #dtbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dt",5.,5.,math.pi/4,-1.)
+                        #dtr = Robot(dtbr)
+                        #dtrplan = FDAPF(dtr.robot, dtr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (1,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                        #dtr.set_planner(dtrplan)
+                        #sdt = Simulator(env,t_step,t_lim,prec,ploting=False)
+                        #sdt.add_agent(dtr)
+                        #sdt.run2(dtr)
+                        #sdt.compute_data()
+                        #fdt = open(filedt, 'a', encoding = "utf-8")
+                        #fdt.write(str(file) + ';' + str(dtr.path_length) + ';' + str(dtr.sum_angle[0]) + ';' + str(dtr.sum_angle[1]) + ';' + str(dtr.sum_angle[2]) 
+                        #         + ';' + str(dtr.max_angle) + ';' + str(dtr.time_to_reach_goal) + ';' + str(dtr.planner.comp_time) + ';' + str(dtr.planner.nb_collision[0]) + '\n')
+                        #fdt.close()
 
-                        dibr = BabyRobot(start.copy(),0,1,0,1,0.1,"di")
-                        dir = Robot(dibr)
-                        dirplan = FDAPF(dir.robot, dir.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (1,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                        dir.set_planner(dirplan)
-                        sdi = Simulator(env,t_step,t_lim,prec)
-                        sdi.add_agent(dir)
-                        sdi.run2(dir)
-                        sdi.compute_data()
-                        fdi = open(filedi, 'a', encoding = "utf-8")
-                        fdi.write(str(file) + ';' + str(dir.path_length) + ';' + str(dir.sum_angle[0]) + ';' + str(dir.sum_angle[1]) + ';' + str(dir.sum_angle[2]) 
-                                 + ';' + str(dir.max_angle) + ';' + str(dir.time_to_reach_goal) + ';' + str(dir.planner.comp_time) + ';' + str(dir.planner.nb_collision[0]) + '\n')
-                        fdi.close()
+                        #dibr = BabyRobot(start.copy(),0,1,0,1,0.1,"di",5.,5.,math.pi/4,-1.)
+                        #dir = Robot(dibr)
+                        #dirplan = FDAPF(dir.robot, dir.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (1,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                        #dir.set_planner(dirplan)
+                        #sdi = Simulator(env,t_step,t_lim,prec,ploting=False)
+                        #sdi.add_agent(dir)
+                        #sdi.run2(dir)
+                        #sdi.compute_data()
+                        #fdi = open(filedi, 'a', encoding = "utf-8")
+                        #fdi.write(str(file) + ';' + str(dir.path_length) + ';' + str(dir.sum_angle[0]) + ';' + str(dir.sum_angle[1]) + ';' + str(dir.sum_angle[2]) 
+                        #         + ';' + str(dir.max_angle) + ';' + str(dir.time_to_reach_goal) + ';' + str(dir.planner.comp_time) + ';' + str(dir.planner.nb_collision[0]) + '\n')
+                        #fdi.close()
 
-                        ditbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dit")
-                        ditr = Robot(ditbr)
-                        ditrplan = FDAPF(ditr.robot, ditr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (0.3,0.3,0.3), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                        ditr.set_planner(ditrplan)
-                        sdit = Simulator(env,t_step,t_lim,prec)
-                        sdit.add_agent(ditr)
-                        sdit.run2(ditr)
-                        sdit.compute_data()
-                        fdit = open(filedit, 'a', encoding = "utf-8")
-                        fdit.write(str(file) + ';' + str(ditr.path_length) + ';' + str(ditr.sum_angle[0]) + ';' + str(ditr.sum_angle[1]) + ';' + str(ditr.sum_angle[2]) 
-                                 + ';' + str(ditr.max_angle) + ';' + str(ditr.time_to_reach_goal) + ';' + str(ditr.planner.comp_time) + ';' + str(ditr.planner.nb_collision[0]) + '\n')
-                        fdit.close()
+                        #ditbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dit",5.,5.,math.pi/4,-1.)
+                        #ditr = Robot(ditbr)
+                        #ditrplan = FDAPF(ditr.robot, ditr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (0.3,0.3,0.3), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                        #ditr.set_planner(ditrplan)
+                        #sdit = Simulator(env,t_step,t_lim,prec,ploting=False)
+                        #sdit.add_agent(ditr)
+                        #sdit.run2(ditr)
+                        #sdit.compute_data()
+                        #fdit = open(filedit, 'a', encoding = "utf-8")
+                        #fdit.write(str(file) + ';' + str(ditr.path_length) + ';' + str(ditr.sum_angle[0]) + ';' + str(ditr.sum_angle[1]) + ';' + str(ditr.sum_angle[2]) 
+                        #         + ';' + str(ditr.max_angle) + ';' + str(ditr.time_to_reach_goal) + ';' + str(ditr.planner.comp_time) + ';' + str(ditr.planner.nb_collision[0]) + '\n')
+                        #fdit.close()
+
+                        dwabr = BabyRobot(start.copy(),0,1,0,1,0.1,"dwar",5.,5.,math.pi/4,-1.)
+                        dwar = Robot(dwabr)
+                        dwarplan = DWA(dwar.robot, dwar.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 0.2, 0.4, 0.2, 0.4, 1., 0.1, 0.1, color_trace = (1,0,0), lookahead_dist = 4.)
+                        dwar.set_planner(dwarplan)
+                        sdwa = Simulator(env,t_step,t_lim,prec,ploting=False)
+                        sdwa.add_agent(dwar)
+                        sdwa.run2(dwar)
+                        sdwa.compute_data()
+                        fdwa = open(filedwa, 'a', encoding = "utf-8")
+                        fdwa.write(str(file) + ';' + str(dwar.path_length) + ';' + str(dwar.sum_angle[0]) + ';' + str(dwar.sum_angle[1]) + ';' + str(dwar.sum_angle[2]) 
+                                 + ';' + str(dwar.max_angle) + ';' + str(dwar.time_to_reach_goal) + ';' + str(dwar.planner.comp_time) + ';' + str(dwar.planner.nb_collision[0]) + '\n')
+                        fdwa.close()
 
                         test += 1
 
 def main6():
+    """
+    U-shape benchmark, commented part are used to run it on multiple CPU.
+    """
     lrpos = [0.05,0.2,0.5,0.8,0.95] #obstacle on left-right percentage
     btpos = [0.,-0.25,0.25] #obstacle on bot-top percentage
     dec = [0.,0.05] #broke symetry from on point in 0.1 to one in 0.05 and 0.15 (point to door)
@@ -3046,40 +4071,45 @@ def main6():
     fc.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
     fc.close()
 
-    filet = "tests/benchmarku/ut.txt"
-    ft = open(filet, 'w', encoding = "utf-8")
-    ft.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    ft.close()
+    #filet = "tests/benchmarku/ut.txt"
+    #ft = open(filet, 'w', encoding = "utf-8")
+    #ft.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #ft.close()
 
-    filei = "tests/benchmarku/ui.txt"
-    fi = open(filei, 'w', encoding = "utf-8")
-    fi.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fi.close()
+    #filei = "tests/benchmarku/ui.txt"
+    #fi = open(filei, 'w', encoding = "utf-8")
+    #fi.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fi.close()
 
-    fileit = "tests/benchmarku/uit.txt"
-    fit = open(fileit, 'w', encoding = "utf-8")
-    fit.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fit.close()
+    #fileit = "tests/benchmarku/uit.txt"
+    #fit = open(fileit, 'w', encoding = "utf-8")
+    #fit.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fit.close()
 
-    filedc = "tests/benchmarku/udc.txt"
-    fdc = open(filedc, 'w', encoding = "utf-8")
-    fdc.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fdc.close()
+    #filedc = "tests/benchmarku/udc.txt"
+    #fdc = open(filedc, 'w', encoding = "utf-8")
+    #fdc.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdc.close()
 
-    filedt = "tests/benchmarku/udt.txt"
-    fdt = open(filedt, 'w', encoding = "utf-8")
-    fdt.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fdt.close()
+    #filedt = "tests/benchmarku/udt.txt"
+    #fdt = open(filedt, 'w', encoding = "utf-8")
+    #fdt.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdt.close()
 
-    filedi = "tests/benchmarku/udi.txt"
-    fdi = open(filedi, 'w', encoding = "utf-8")
-    fdi.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fdi.close()
+    #filedi = "tests/benchmarku/udi.txt"
+    #fdi = open(filedi, 'w', encoding = "utf-8")
+    #fdi.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdi.close()
 
-    filedit = "tests/benchmarku/udit.txt"
-    fdit = open(filedit, 'w', encoding = "utf-8")
-    fdit.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fdit.close()
+    #filedit = "tests/benchmarku/udit.txt"
+    #fdit = open(filedit, 'w', encoding = "utf-8")
+    #fdit.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdit.close()
+
+    #filedwa = "tests/benchmarku/udwa.txt"
+    #fdwa = open(filedwa, 'w', encoding = "utf-8")
+    #fdwa.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdwa.close()
 
     #walls
     for a in range(len(ls)):
@@ -3106,47 +4136,52 @@ def main6():
                                     env.from_grid_to_map(env_init, 0.)
                                     obstacles = env.obs_circ
 
-                                    cbr = BabyRobot(start.copy(),0,1,0,1,0.1,"cr")
+                                    cbr = BabyRobot(start.copy(),0,1,0,1,0.1,"cr",5.,5.,math.pi/4,-1.)
                                     cr = Robot(cbr)
                                     crplan = FAPF(cr.robot, cr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (1,0,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
                                     cr.set_planner(crplan)
 
-                                    tbr = BabyRobot(start.copy(),0,1,0,1,0.1,"tr")
-                                    tr = Robot(tbr)
-                                    trplan = FAPF(tr.robot, tr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (0,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                                    tr.set_planner(trplan)
+                                    #tbr = BabyRobot(start.copy(),0,1,0,1,0.1,"tr",5.,5.,math.pi/4,-1.)
+                                    #tr = Robot(tbr)
+                                    #trplan = FAPF(tr.robot, tr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (0,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                                    #tr.set_planner(trplan)
 
-                                    ibr = BabyRobot(start.copy(),0,1,0,1,0.1,"ir")
-                                    ir = Robot(ibr)
-                                    irplan = FAPF(ir.robot, ir.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (0,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                                    ir.set_planner(irplan)
+                                    #ibr = BabyRobot(start.copy(),0,1,0,1,0.1,"ir",5.,5.,math.pi/4,-1.)
+                                    #ir = Robot(ibr)
+                                    #irplan = FAPF(ir.robot, ir.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (0,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                                    #ir.set_planner(irplan)
 
-                                    itbr = BabyRobot(start.copy(),0,1,0,1,0.1,"itr")
-                                    itr = Robot(itbr)
-                                    itrplan = FAPF(itr.robot, itr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (1,1,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                                    itr.set_planner(itrplan)
+                                    #itbr = BabyRobot(start.copy(),0,1,0,1,0.1,"itr",5.,5.,math.pi/4,-1.)
+                                    #itr = Robot(itbr)
+                                    #itrplan = FAPF(itr.robot, itr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (1,1,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                                    #itr.set_planner(itrplan)
 
-                                    dcbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dc")
-                                    dcr = Robot(dcbr)
-                                    dcrplan = FDAPF(dcr.robot, dcr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (0,1,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                                    dcr.set_planner(dcrplan)
+                                    #dcbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dc",5.,5.,math.pi/4,-1.)
+                                    #dcr = Robot(dcbr)
+                                    #dcrplan = FDAPF(dcr.robot, dcr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (0,1,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                                    #dcr.set_planner(dcrplan)
 
-                                    dtbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dt")
-                                    dtr = Robot(dtbr)
-                                    dtrplan = FDAPF(dtr.robot, dtr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (1,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                                    dtr.set_planner(dtrplan)
+                                    #dtbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dt",5.,5.,math.pi/4,-1.)
+                                    #dtr = Robot(dtbr)
+                                    #dtrplan = FDAPF(dtr.robot, dtr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (1,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                                    #dtr.set_planner(dtrplan)
 
-                                    dibr = BabyRobot(start.copy(),0,1,0,1,0.1,"di")
-                                    dir = Robot(dibr)
-                                    dirplan = FDAPF(dir.robot, dir.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (1,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                                    dir.set_planner(dirplan)
+                                    #dibr = BabyRobot(start.copy(),0,1,0,1,0.1,"di",5.,5.,math.pi/4,-1.)
+                                    #dir = Robot(dibr)
+                                    #dirplan = FDAPF(dir.robot, dir.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (1,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                                    #dir.set_planner(dirplan)
 
-                                    ditbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dit")
-                                    ditr = Robot(ditbr)
-                                    ditrplan = FDAPF(ditr.robot, ditr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (0.3,0.3,0.3), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                                    ditr.set_planner(ditrplan)
+                                    #ditbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dit",5.,5.,math.pi/4,-1.)
+                                    #ditr = Robot(ditbr)
+                                    #ditrplan = FDAPF(ditr.robot, ditr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (0.3,0.3,0.3), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                                    #ditr.set_planner(ditrplan)
 
-                                    sc = Simulator(env,t_step,t_lim,prec)
+                                    #dwabr = BabyRobot(start.copy(),0,1,0,1,0.1,"dwar",5.,5.,math.pi/4,-1.)
+                                    #dwar = Robot(dwabr)
+                                    #dwarplan = DWA(dwar.robot, dwar.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 0.2, 0.4, 0.2, 0.4, 1., 0.1, 0.1, color_trace = (1,0,0), lookahead_dist = 4.)
+                                    #dwar.set_planner(dwarplan)
+
+                                    sc = Simulator(env,t_step,t_lim,prec,ploting=False)
                                     sc.add_agent(cr)
                                     sc.run2(cr)
                                     sc.compute_data()
@@ -3155,73 +4190,85 @@ def main6():
                                              + ';' + str(cr.max_angle) + ';' + str(cr.time_to_reach_goal) + ';' + str(cr.planner.comp_time) + ';' + str(cr.planner.nb_collision[0]) + '\n')
                                     fc.close()
 
-                                    st = Simulator(env,t_step,t_lim,prec)
-                                    st.add_agent(tr)
-                                    st.run2(tr)
-                                    st.compute_data()
-                                    ft = open(filet, 'a', encoding = "utf-8")
-                                    ft.write(str(file) + ';' + str(tr.path_length) + ';' + str(tr.sum_angle[0]) + ';' + str(tr.sum_angle[1]) + ';' + str(tr.sum_angle[2]) 
-                                             + ';' + str(tr.max_angle) + ';' + str(tr.time_to_reach_goal) + ';' + str(tr.planner.comp_time) + ';' + str(tr.planner.nb_collision[0]) + '\n')
-                                    ft.close()
+                                    #st = Simulator(env,t_step,t_lim,prec,ploting=False)
+                                    #st.add_agent(tr)
+                                    #st.run2(tr)
+                                    #st.compute_data()
+                                    #ft = open(filet, 'a', encoding = "utf-8")
+                                    #ft.write(str(file) + ';' + str(tr.path_length) + ';' + str(tr.sum_angle[0]) + ';' + str(tr.sum_angle[1]) + ';' + str(tr.sum_angle[2]) 
+                                    #         + ';' + str(tr.max_angle) + ';' + str(tr.time_to_reach_goal) + ';' + str(tr.planner.comp_time) + ';' + str(tr.planner.nb_collision[0]) + '\n')
+                                    #ft.close()
 
-                                    si = Simulator(env,t_step,t_lim,prec)
-                                    si.add_agent(ir)
-                                    si.run2(ir)
-                                    si.compute_data()
-                                    fi = open(filei, 'a', encoding = "utf-8")
-                                    fi.write(str(file) + ';' + str(ir.path_length) + ';' + str(ir.sum_angle[0]) + ';' + str(ir.sum_angle[1]) + ';' + str(ir.sum_angle[2]) 
-                                             + ';' + str(ir.max_angle) + ';' + str(ir.time_to_reach_goal) + ';' + str(ir.planner.comp_time) + ';' + str(ir.planner.nb_collision[0]) + '\n')
-                                    fi.close()
+                                    #si = Simulator(env,t_step,t_lim,prec,ploting=False)
+                                    #si.add_agent(ir)
+                                    #si.run2(ir)
+                                    #si.compute_data()
+                                    #fi = open(filei, 'a', encoding = "utf-8")
+                                    #fi.write(str(file) + ';' + str(ir.path_length) + ';' + str(ir.sum_angle[0]) + ';' + str(ir.sum_angle[1]) + ';' + str(ir.sum_angle[2]) 
+                                    #         + ';' + str(ir.max_angle) + ';' + str(ir.time_to_reach_goal) + ';' + str(ir.planner.comp_time) + ';' + str(ir.planner.nb_collision[0]) + '\n')
+                                    #fi.close()
 
-                                    sit = Simulator(env,t_step,t_lim,prec)
-                                    sit.add_agent(itr)
-                                    sit.run2(itr)
-                                    sit.compute_data()
-                                    fit = open(fileit, 'a', encoding = "utf-8")
-                                    fit.write(str(file) + ';' + str(itr.path_length) + ';' + str(itr.sum_angle[0]) + ';' + str(itr.sum_angle[1]) + ';' + str(itr.sum_angle[2]) 
-                                             + ';' + str(itr.max_angle) + ';' + str(itr.time_to_reach_goal) + ';' + str(itr.planner.comp_time) + ';' + str(itr.planner.nb_collision[0]) + '\n')
-                                    fit.close()
+                                    #sit = Simulator(env,t_step,t_lim,prec,ploting=False)
+                                    #sit.add_agent(itr)
+                                    #sit.run2(itr)
+                                    #sit.compute_data()
+                                    #fit = open(fileit, 'a', encoding = "utf-8")
+                                    #fit.write(str(file) + ';' + str(itr.path_length) + ';' + str(itr.sum_angle[0]) + ';' + str(itr.sum_angle[1]) + ';' + str(itr.sum_angle[2]) 
+                                    #         + ';' + str(itr.max_angle) + ';' + str(itr.time_to_reach_goal) + ';' + str(itr.planner.comp_time) + ';' + str(itr.planner.nb_collision[0]) + '\n')
+                                    #fit.close()
 
-                                    sdc = Simulator(env,t_step,t_lim,prec)
-                                    sdc.add_agent(dcr)
-                                    sdc.run2(dcr)
-                                    sdc.compute_data()
-                                    fdc = open(filedc, 'a', encoding = "utf-8")
-                                    fdc.write(str(file) + ';' + str(dcr.path_length) + ';' + str(dcr.sum_angle[0]) + ';' + str(dcr.sum_angle[1]) + ';' + str(dcr.sum_angle[2]) 
-                                             + ';' + str(dcr.max_angle) + ';' + str(dcr.time_to_reach_goal) + ';' + str(dcr.planner.comp_time) + ';' + str(dcr.planner.nb_collision[0]) + '\n')
-                                    fdc.close()
+                                    #sdc = Simulator(env,t_step,t_lim,prec,ploting=False)
+                                    #sdc.add_agent(dcr)
+                                    #sdc.run2(dcr)
+                                    #sdc.compute_data()
+                                    #fdc = open(filedc, 'a', encoding = "utf-8")
+                                    #fdc.write(str(file) + ';' + str(dcr.path_length) + ';' + str(dcr.sum_angle[0]) + ';' + str(dcr.sum_angle[1]) + ';' + str(dcr.sum_angle[2]) 
+                                    #         + ';' + str(dcr.max_angle) + ';' + str(dcr.time_to_reach_goal) + ';' + str(dcr.planner.comp_time) + ';' + str(dcr.planner.nb_collision[0]) + '\n')
+                                    #fdc.close()
 
-                                    sdt = Simulator(env,t_step,t_lim,prec)
-                                    sdt.add_agent(dtr)
-                                    sdt.run2(dtr)
-                                    sdt.compute_data()
-                                    fdt = open(filedt, 'a', encoding = "utf-8")
-                                    fdt.write(str(file) + ';' + str(dtr.path_length) + ';' + str(dtr.sum_angle[0]) + ';' + str(dtr.sum_angle[1]) + ';' + str(dtr.sum_angle[2]) 
-                                             + ';' + str(dtr.max_angle) + ';' + str(dtr.time_to_reach_goal) + ';' + str(dtr.planner.comp_time) + ';' + str(dtr.planner.nb_collision[0]) + '\n')
-                                    fdt.close()
+                                    #sdt = Simulator(env,t_step,t_lim,prec,ploting=False)
+                                    #sdt.add_agent(dtr)
+                                    #sdt.run2(dtr)
+                                    #sdt.compute_data()
+                                    #fdt = open(filedt, 'a', encoding = "utf-8")
+                                    #fdt.write(str(file) + ';' + str(dtr.path_length) + ';' + str(dtr.sum_angle[0]) + ';' + str(dtr.sum_angle[1]) + ';' + str(dtr.sum_angle[2]) 
+                                    #         + ';' + str(dtr.max_angle) + ';' + str(dtr.time_to_reach_goal) + ';' + str(dtr.planner.comp_time) + ';' + str(dtr.planner.nb_collision[0]) + '\n')
+                                    #fdt.close()
 
-                                    sdi = Simulator(env,t_step,t_lim,prec)
-                                    sdi.add_agent(dir)
-                                    sdi.run2(dir)
-                                    sdi.compute_data()
-                                    fdi = open(filedi, 'a', encoding = "utf-8")
-                                    fdi.write(str(file) + ';' + str(dir.path_length) + ';' + str(dir.sum_angle[0]) + ';' + str(dir.sum_angle[1]) + ';' + str(dir.sum_angle[2]) 
-                                             + ';' + str(dir.max_angle) + ';' + str(dir.time_to_reach_goal) + ';' + str(dir.planner.comp_time) + ';' + str(dir.planner.nb_collision[0]) + '\n')
-                                    fdi.close()
+                                    #sdi = Simulator(env,t_step,t_lim,prec,ploting=False)
+                                    #sdi.add_agent(dir)
+                                    #sdi.run2(dir)
+                                    #sdi.compute_data()
+                                    #fdi = open(filedi, 'a', encoding = "utf-8")
+                                    #fdi.write(str(file) + ';' + str(dir.path_length) + ';' + str(dir.sum_angle[0]) + ';' + str(dir.sum_angle[1]) + ';' + str(dir.sum_angle[2]) 
+                                    #         + ';' + str(dir.max_angle) + ';' + str(dir.time_to_reach_goal) + ';' + str(dir.planner.comp_time) + ';' + str(dir.planner.nb_collision[0]) + '\n')
+                                    #fdi.close()
 
-                                    sdit = Simulator(env,t_step,t_lim,prec)
-                                    sdit.add_agent(ditr)
-                                    sdit.run2(ditr)
-                                    sdit.compute_data()
-                                    fdit = open(filedit, 'a', encoding = "utf-8")
-                                    fdit.write(str(file) + ';' + str(ditr.path_length) + ';' + str(ditr.sum_angle[0]) + ';' + str(ditr.sum_angle[1]) + ';' + str(ditr.sum_angle[2]) 
-                                             + ';' + str(ditr.max_angle) + ';' + str(ditr.time_to_reach_goal) + ';' + str(ditr.planner.comp_time) + ';' + str(ditr.planner.nb_collision[0]) + '\n')
-                                    fdit.close()
+                                    #sdit = Simulator(env,t_step,t_lim,prec,ploting=False)
+                                    #sdit.add_agent(ditr)
+                                    #sdit.run2(ditr)
+                                    #sdit.compute_data()
+                                    #fdit = open(filedit, 'a', encoding = "utf-8")
+                                    #fdit.write(str(file) + ';' + str(ditr.path_length) + ';' + str(ditr.sum_angle[0]) + ';' + str(ditr.sum_angle[1]) + ';' + str(ditr.sum_angle[2]) 
+                                    #         + ';' + str(ditr.max_angle) + ';' + str(ditr.time_to_reach_goal) + ';' + str(ditr.planner.comp_time) + ';' + str(ditr.planner.nb_collision[0]) + '\n')
+                                    #fdit.close()
+
+                                    #sdwa = Simulator(env,t_step,t_lim,prec,ploting=False)
+                                    #sdwa.add_agent(dwar)
+                                    #sdwa.run2(dwar)
+                                    #sdwa.compute_data()
+                                    #fdwa = open(filedwa, 'a', encoding = "utf-8")
+                                    #fdwa.write(str(file) + ';' + str(dwar.path_length) + ';' + str(dwar.sum_angle[0]) + ';' + str(dwar.sum_angle[1]) + ';' + str(dwar.sum_angle[2]) 
+                                    #         + ';' + str(dwar.max_angle) + ';' + str(dwar.time_to_reach_goal) + ';' + str(dwar.planner.comp_time) + ';' + str(dwar.planner.nb_collision[0]) + '\n')
+                                    #fdwa.close()
 
                                     test += 1
 
 
 def main8():
+    """
+    V-shape benchmark, commented part are used to run it on multiple CPU.
+    """
     lrpos = [0.05,0.2,0.5,0.8,0.95] #obstacle on left-right percentage
     btpos = [0.,-0.25,0.25] #obstacle on bot-top percentage
     dec = [0.,0.05] #broke symetry from on point in 0.1 to one in 0.05 and 0.15 (point to door)
@@ -3237,45 +4284,50 @@ def main8():
     t_lim = 60
     t_step = 0.1
 
-    filec = "tests/benchmarkv/uc.txt"
+    filec = "tests/benchmarkv/vc.txt"
     fc = open(filec, 'w', encoding = "utf-8")
     fc.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
     fc.close()
 
-    filet = "tests/benchmarkv/ut.txt"
-    ft = open(filet, 'w', encoding = "utf-8")
-    ft.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    ft.close()
+    #filet = "tests/benchmarkv/vt.txt"
+    #ft = open(filet, 'w', encoding = "utf-8")
+    #ft.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #ft.close()
 
-    filei = "tests/benchmarkv/ui.txt"
-    fi = open(filei, 'w', encoding = "utf-8")
-    fi.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fi.close()
+    #filei = "tests/benchmarkv/vi.txt"
+    #fi = open(filei, 'w', encoding = "utf-8")
+    #fi.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fi.close()
 
-    fileit = "tests/benchmarkv/uit.txt"
-    fit = open(fileit, 'w', encoding = "utf-8")
-    fit.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fit.close()
+    #fileit = "tests/benchmarkv/vit.txt"
+    #fit = open(fileit, 'w', encoding = "utf-8")
+    #fit.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fit.close()
 
-    filedc = "tests/benchmarkv/udc.txt"
-    fdc = open(filedc, 'w', encoding = "utf-8")
-    fdc.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fdc.close()
+    #filedc = "tests/benchmarkv/vdc.txt"
+    #fdc = open(filedc, 'w', encoding = "utf-8")
+    #fdc.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdc.close()
 
-    filedt = "tests/benchmarkv/udt.txt"
-    fdt = open(filedt, 'w', encoding = "utf-8")
-    fdt.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fdt.close()
+    #filedt = "tests/benchmarkv/vdt.txt"
+    #fdt = open(filedt, 'w', encoding = "utf-8")
+    #fdt.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdt.close()
 
-    filedi = "tests/benchmarkv/udi.txt"
-    fdi = open(filedi, 'w', encoding = "utf-8")
-    fdi.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fdi.close()
+    #filedi = "tests/benchmarkv/vdi.txt"
+    #fdi = open(filedi, 'w', encoding = "utf-8")
+    #fdi.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdi.close()
 
-    filedit = "tests/benchmarkv/udit.txt"
-    fdit = open(filedit, 'w', encoding = "utf-8")
-    fdit.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
-    fdit.close()
+    #filedit = "tests/benchmarkv/vdit.txt"
+    #fdit = open(filedit, 'w', encoding = "utf-8")
+    #fdit.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdit.close()
+
+    #filedwa = "tests/benchmarkv/vdwa.txt"
+    #fdwa = open(filedwa, 'w', encoding = "utf-8")
+    #fdwa.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdwa.close()
 
     #walls
     for a in range(len(ls)):
@@ -3302,47 +4354,52 @@ def main8():
                                     env.from_grid_to_map(env_init, 0.)
                                     obstacles = env.obs_circ
 
-                                    cbr = BabyRobot(start.copy(),0,1,0,1,0.1,"cr")
+                                    cbr = BabyRobot(start.copy(),0,1,0,1,0.1,"cr",5.,5.,math.pi/4,-1.)
                                     cr = Robot(cbr)
                                     crplan = FAPF(cr.robot, cr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (1,0,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
                                     cr.set_planner(crplan)
 
-                                    tbr = BabyRobot(start.copy(),0,1,0,1,0.1,"tr")
-                                    tr = Robot(tbr)
-                                    trplan = FAPF(tr.robot, tr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (0,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                                    tr.set_planner(trplan)
+                                    #tbr = BabyRobot(start.copy(),0,1,0,1,0.1,"tr",5.,5.,math.pi/4,-1.)
+                                    #tr = Robot(tbr)
+                                    #trplan = FAPF(tr.robot, tr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (0,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                                    #tr.set_planner(trplan)
 
-                                    ibr = BabyRobot(start.copy(),0,1,0,1,0.1,"ir")
-                                    ir = Robot(ibr)
-                                    irplan = FAPF(ir.robot, ir.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (0,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                                    ir.set_planner(irplan)
+                                    #ibr = BabyRobot(start.copy(),0,1,0,1,0.1,"ir",5.,5.,math.pi/4,-1.)
+                                    #ir = Robot(ibr)
+                                    #irplan = FAPF(ir.robot, ir.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (0,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                                    #ir.set_planner(irplan)
 
-                                    itbr = BabyRobot(start.copy(),0,1,0,1,0.1,"itr")
-                                    itr = Robot(itbr)
-                                    itrplan = FAPF(itr.robot, itr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (1,1,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                                    itr.set_planner(itrplan)
+                                    #itbr = BabyRobot(start.copy(),0,1,0,1,0.1,"itr",5.,5.,math.pi/4,-1.)
+                                    #itr = Robot(itbr)
+                                    #itrplan = FAPF(itr.robot, itr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (1,1,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                                    #itr.set_planner(itrplan)
 
-                                    dcbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dc")
-                                    dcr = Robot(dcbr)
-                                    dcrplan = FDAPF(dcr.robot, dcr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (0,1,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                                    dcr.set_planner(dcrplan)
+                                    #dcbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dc",5.,5.,math.pi/4,-1.)
+                                    #dcr = Robot(dcbr)
+                                    #dcrplan = FDAPF(dcr.robot, dcr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (0,1,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                                    #dcr.set_planner(dcrplan)
 
-                                    dtbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dt")
-                                    dtr = Robot(dtbr)
-                                    dtrplan = FDAPF(dtr.robot, dtr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (1,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                                    dtr.set_planner(dtrplan)
+                                    #dtbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dt",5.,5.,math.pi/4,-1.)
+                                    #dtr = Robot(dtbr)
+                                    #dtrplan = FDAPF(dtr.robot, dtr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (1,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                                    #dtr.set_planner(dtrplan)
 
-                                    dibr = BabyRobot(start.copy(),0,1,0,1,0.1,"di")
-                                    dir = Robot(dibr)
-                                    dirplan = FDAPF(dir.robot, dir.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (1,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                                    dir.set_planner(dirplan)
+                                    #dibr = BabyRobot(start.copy(),0,1,0,1,0.1,"di",5.,5.,math.pi/4,-1.)
+                                    #dir = Robot(dibr)
+                                    #dirplan = FDAPF(dir.robot, dir.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (1,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                                    #dir.set_planner(dirplan)
 
-                                    ditbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dit")
-                                    ditr = Robot(ditbr)
-                                    ditrplan = FDAPF(ditr.robot, ditr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (0.3,0.3,0.3), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
-                                    ditr.set_planner(ditrplan)
+                                    #ditbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dit",5.,5.,math.pi/4,-1.)
+                                    #ditr = Robot(ditbr)
+                                    #ditrplan = FDAPF(ditr.robot, ditr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (0.3,0.3,0.3), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+                                    #ditr.set_planner(ditrplan)
 
-                                    sc = Simulator(env,t_step,t_lim,prec)
+                                    #dwabr = BabyRobot(start.copy(),0,1,0,1,0.1,"dwar",5.,5.,math.pi/4,-1.)
+                                    #dwar = Robot(dwabr)
+                                    #dwarplan = DWA(dwar.robot, dwar.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 0.2, 0.4, 0.2, 0.4, 1., 0.1, 0.1, color_trace = (1,0,0), lookahead_dist = 4.)
+                                    #dwar.set_planner(dwarplan)
+
+                                    sc = Simulator(env,t_step,t_lim,prec,ploting=False)
                                     sc.add_agent(cr)
                                     sc.run2(cr)
                                     sc.compute_data()
@@ -3351,72 +4408,84 @@ def main8():
                                              + ';' + str(cr.max_angle) + ';' + str(cr.time_to_reach_goal) + ';' + str(cr.planner.comp_time) + ';' + str(cr.planner.nb_collision[0]) + '\n')
                                     fc.close()
 
-                                    st = Simulator(env,t_step,t_lim,prec)
-                                    st.add_agent(tr)
-                                    st.run2(tr)
-                                    st.compute_data()
-                                    ft = open(filet, 'a', encoding = "utf-8")
-                                    ft.write(str(file) + ';' + str(tr.path_length) + ';' + str(tr.sum_angle[0]) + ';' + str(tr.sum_angle[1]) + ';' + str(tr.sum_angle[2]) 
-                                             + ';' + str(tr.max_angle) + ';' + str(tr.time_to_reach_goal) + ';' + str(tr.planner.comp_time) + ';' + str(tr.planner.nb_collision[0]) + '\n')
-                                    ft.close()
+                                    #st = Simulator(env,t_step,t_lim,prec,ploting=False)
+                                    #st.add_agent(tr)
+                                    #st.run2(tr)
+                                    #st.compute_data()
+                                    #ft = open(filet, 'a', encoding = "utf-8")
+                                    #ft.write(str(file) + ';' + str(tr.path_length) + ';' + str(tr.sum_angle[0]) + ';' + str(tr.sum_angle[1]) + ';' + str(tr.sum_angle[2]) 
+                                    #         + ';' + str(tr.max_angle) + ';' + str(tr.time_to_reach_goal) + ';' + str(tr.planner.comp_time) + ';' + str(tr.planner.nb_collision[0]) + '\n')
+                                    #ft.close()
 
-                                    si = Simulator(env,t_step,t_lim,prec)
-                                    si.add_agent(ir)
-                                    si.run2(ir)
-                                    si.compute_data()
-                                    fi = open(filei, 'a', encoding = "utf-8")
-                                    fi.write(str(file) + ';' + str(ir.path_length) + ';' + str(ir.sum_angle[0]) + ';' + str(ir.sum_angle[1]) + ';' + str(ir.sum_angle[2]) 
-                                             + ';' + str(ir.max_angle) + ';' + str(ir.time_to_reach_goal) + ';' + str(ir.planner.comp_time) + ';' + str(ir.planner.nb_collision[0]) + '\n')
-                                    fi.close()
+                                    #si = Simulator(env,t_step,t_lim,prec,ploting=False)
+                                    #si.add_agent(ir)
+                                    #si.run2(ir)
+                                    #si.compute_data()
+                                    #fi = open(filei, 'a', encoding = "utf-8")
+                                    #fi.write(str(file) + ';' + str(ir.path_length) + ';' + str(ir.sum_angle[0]) + ';' + str(ir.sum_angle[1]) + ';' + str(ir.sum_angle[2]) 
+                                    #         + ';' + str(ir.max_angle) + ';' + str(ir.time_to_reach_goal) + ';' + str(ir.planner.comp_time) + ';' + str(ir.planner.nb_collision[0]) + '\n')
+                                    #fi.close()
 
-                                    sit = Simulator(env,t_step,t_lim,prec)
-                                    sit.add_agent(itr)
-                                    sit.run2(itr)
-                                    sit.compute_data()
-                                    fit = open(fileit, 'a', encoding = "utf-8")
-                                    fit.write(str(file) + ';' + str(itr.path_length) + ';' + str(itr.sum_angle[0]) + ';' + str(itr.sum_angle[1]) + ';' + str(itr.sum_angle[2]) 
-                                             + ';' + str(itr.max_angle) + ';' + str(itr.time_to_reach_goal) + ';' + str(itr.planner.comp_time) + ';' + str(itr.planner.nb_collision[0]) + '\n')
-                                    fit.close()
+                                    #sit = Simulator(env,t_step,t_lim,prec,ploting=False)
+                                    #sit.add_agent(itr)
+                                    #sit.run2(itr)
+                                    #sit.compute_data()
+                                    #fit = open(fileit, 'a', encoding = "utf-8")
+                                    #fit.write(str(file) + ';' + str(itr.path_length) + ';' + str(itr.sum_angle[0]) + ';' + str(itr.sum_angle[1]) + ';' + str(itr.sum_angle[2]) 
+                                    #         + ';' + str(itr.max_angle) + ';' + str(itr.time_to_reach_goal) + ';' + str(itr.planner.comp_time) + ';' + str(itr.planner.nb_collision[0]) + '\n')
+                                    #fit.close()
 
-                                    sdc = Simulator(env,t_step,t_lim,prec)
-                                    sdc.add_agent(dcr)
-                                    sdc.run2(dcr)
-                                    sdc.compute_data()
-                                    fdc = open(filedc, 'a', encoding = "utf-8")
-                                    fdc.write(str(file) + ';' + str(dcr.path_length) + ';' + str(dcr.sum_angle[0]) + ';' + str(dcr.sum_angle[1]) + ';' + str(dcr.sum_angle[2]) 
-                                             + ';' + str(dcr.max_angle) + ';' + str(dcr.time_to_reach_goal) + ';' + str(dcr.planner.comp_time) + ';' + str(dcr.planner.nb_collision[0]) + '\n')
-                                    fdc.close()
+                                    #sdc = Simulator(env,t_step,t_lim,prec,ploting=False)
+                                    #sdc.add_agent(dcr)
+                                    #sdc.run2(dcr)
+                                    #sdc.compute_data()
+                                    #fdc = open(filedc, 'a', encoding = "utf-8")
+                                    #fdc.write(str(file) + ';' + str(dcr.path_length) + ';' + str(dcr.sum_angle[0]) + ';' + str(dcr.sum_angle[1]) + ';' + str(dcr.sum_angle[2]) 
+                                    #         + ';' + str(dcr.max_angle) + ';' + str(dcr.time_to_reach_goal) + ';' + str(dcr.planner.comp_time) + ';' + str(dcr.planner.nb_collision[0]) + '\n')
+                                    #fdc.close()
 
-                                    sdt = Simulator(env,t_step,t_lim,prec)
-                                    sdt.add_agent(dtr)
-                                    sdt.run2(dtr)
-                                    sdt.compute_data()
-                                    fdt = open(filedt, 'a', encoding = "utf-8")
-                                    fdt.write(str(file) + ';' + str(dtr.path_length) + ';' + str(dtr.sum_angle[0]) + ';' + str(dtr.sum_angle[1]) + ';' + str(dtr.sum_angle[2]) 
-                                             + ';' + str(dtr.max_angle) + ';' + str(dtr.time_to_reach_goal) + ';' + str(dtr.planner.comp_time) + ';' + str(dtr.planner.nb_collision[0]) + '\n')
-                                    fdt.close()
+                                    #sdt = Simulator(env,t_step,t_lim,prec,ploting=False)
+                                    #sdt.add_agent(dtr)
+                                    #sdt.run2(dtr)
+                                    #sdt.compute_data()
+                                    #fdt = open(filedt, 'a', encoding = "utf-8")
+                                    #fdt.write(str(file) + ';' + str(dtr.path_length) + ';' + str(dtr.sum_angle[0]) + ';' + str(dtr.sum_angle[1]) + ';' + str(dtr.sum_angle[2]) 
+                                    #         + ';' + str(dtr.max_angle) + ';' + str(dtr.time_to_reach_goal) + ';' + str(dtr.planner.comp_time) + ';' + str(dtr.planner.nb_collision[0]) + '\n')
+                                    #fdt.close()
 
-                                    sdi = Simulator(env,t_step,t_lim,prec)
-                                    sdi.add_agent(dir)
-                                    sdi.run2(dir)
-                                    sdi.compute_data()
-                                    fdi = open(filedi, 'a', encoding = "utf-8")
-                                    fdi.write(str(file) + ';' + str(dir.path_length) + ';' + str(dir.sum_angle[0]) + ';' + str(dir.sum_angle[1]) + ';' + str(dir.sum_angle[2]) 
-                                             + ';' + str(dir.max_angle) + ';' + str(dir.time_to_reach_goal) + ';' + str(dir.planner.comp_time) + ';' + str(dir.planner.nb_collision[0]) + '\n')
-                                    fdi.close()
+                                    #sdi = Simulator(env,t_step,t_lim,prec,ploting=False)
+                                    #sdi.add_agent(dir)
+                                    #sdi.run2(dir)
+                                    #sdi.compute_data()
+                                    #fdi = open(filedi, 'a', encoding = "utf-8")
+                                    #fdi.write(str(file) + ';' + str(dir.path_length) + ';' + str(dir.sum_angle[0]) + ';' + str(dir.sum_angle[1]) + ';' + str(dir.sum_angle[2]) 
+                                    #         + ';' + str(dir.max_angle) + ';' + str(dir.time_to_reach_goal) + ';' + str(dir.planner.comp_time) + ';' + str(dir.planner.nb_collision[0]) + '\n')
+                                    #fdi.close()
 
-                                    sdit = Simulator(env,t_step,t_lim,prec)
-                                    sdit.add_agent(ditr)
-                                    sdit.run2(ditr)
-                                    sdit.compute_data()
-                                    fdit = open(filedit, 'a', encoding = "utf-8")
-                                    fdit.write(str(file) + ';' + str(ditr.path_length) + ';' + str(ditr.sum_angle[0]) + ';' + str(ditr.sum_angle[1]) + ';' + str(ditr.sum_angle[2]) 
-                                             + ';' + str(ditr.max_angle) + ';' + str(ditr.time_to_reach_goal) + ';' + str(ditr.planner.comp_time) + ';' + str(ditr.planner.nb_collision[0]) + '\n')
-                                    fdit.close()
+                                    #sdit = Simulator(env,t_step,t_lim,prec,ploting=False)
+                                    #sdit.add_agent(ditr)
+                                    #sdit.run2(ditr)
+                                    #sdit.compute_data()
+                                    #fdit = open(filedit, 'a', encoding = "utf-8")
+                                    #fdit.write(str(file) + ';' + str(ditr.path_length) + ';' + str(ditr.sum_angle[0]) + ';' + str(ditr.sum_angle[1]) + ';' + str(ditr.sum_angle[2]) 
+                                    #         + ';' + str(ditr.max_angle) + ';' + str(ditr.time_to_reach_goal) + ';' + str(ditr.planner.comp_time) + ';' + str(ditr.planner.nb_collision[0]) + '\n')
+                                    #fdit.close()
+
+                                    #sdwa = Simulator(env,t_step,t_lim,prec,ploting=False)
+                                    #sdwa.add_agent(dwar)
+                                    #sdwa.run2(dwar)
+                                    #sdwa.compute_data()
+                                    #fdwa = open(filedwa, 'a', encoding = "utf-8")
+                                    #fdwa.write(str(file) + ';' + str(dwar.path_length) + ';' + str(dwar.sum_angle[0]) + ';' + str(dwar.sum_angle[1]) + ';' + str(dwar.sum_angle[2]) 
+                                    #         + ';' + str(dwar.max_angle) + ';' + str(dwar.time_to_reach_goal) + ';' + str(dwar.planner.comp_time) + ';' + str(dwar.planner.nb_collision[0]) + '\n')
+                                    #fdwa.close()
 
                                     test += 1
 
 def main9():
+    """
+    semi-ellipse benchmark, commented part are used to run it on multiple CPU.
+    """
     lrpos = [0.05,0.2,0.5,0.8,0.95] #obstacle on left-right percentage
     btpos = [0.,-0.25,0.25] #obstacle on bot-top percentage
     dec = [0.,0.05] #broke symetry from on point in 0.1 to one in 0.05 and 0.15 (point to door)
@@ -3432,45 +4501,50 @@ def main9():
     t_lim = 60
     t_step = 0.1
 
-    filec = "tests/benchmarke/uc.txt"
+    filec = "tests/benchmarke/ec.txt"
     fc = open(filec, 'w', encoding = "utf-8")
     fc.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
     fc.close()
 
-    filet = "tests/benchmarke/ut.txt"
+    filet = "tests/benchmarke/et.txt"
     ft = open(filet, 'w', encoding = "utf-8")
     ft.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
     ft.close()
 
-    filei = "tests/benchmarke/ui.txt"
+    filei = "tests/benchmarke/ei.txt"
     fi = open(filei, 'w', encoding = "utf-8")
     fi.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
     fi.close()
 
-    fileit = "tests/benchmarke/uit.txt"
+    fileit = "tests/benchmarke/eit.txt"
     fit = open(fileit, 'w', encoding = "utf-8")
     fit.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
     fit.close()
 
-    filedc = "tests/benchmarke/udc.txt"
+    filedc = "tests/benchmarke/edc.txt"
     fdc = open(filedc, 'w', encoding = "utf-8")
     fdc.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
     fdc.close()
 
-    filedt = "tests/benchmarke/udt.txt"
+    filedt = "tests/benchmarke/edt.txt"
     fdt = open(filedt, 'w', encoding = "utf-8")
     fdt.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
     fdt.close()
 
-    filedi = "tests/benchmarke/udi.txt"
+    filedi = "tests/benchmarke/edi.txt"
     fdi = open(filedi, 'w', encoding = "utf-8")
     fdi.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
     fdi.close()
 
-    filedit = "tests/benchmarke/udit.txt"
+    filedit = "tests/benchmarke/edit.txt"
     fdit = open(filedit, 'w', encoding = "utf-8")
     fdit.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
     fdit.close()
+
+    #filedwa = "tests/benchmarke/edwa.txt"
+    #fdwa = open(filedwa, 'w', encoding = "utf-8")
+    #fdwa.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdwa.close()
 
     #walls
     for a in range(len(ls)):
@@ -3478,60 +4552,66 @@ def main9():
             for e in range(len(lrpos)):
                 for f in range(len(btpos)):
                     for g in range(len(theta)):
-                        file = "tests/benchmarke/"
+                        file = "tests/benchmarkenokin/"
                         file = file + "e" + f"{test:08}" + ".txt"
                         #testlist.append(file)
                         print(file)
                         file_split = file.split('.')
                         p = np.array((lrpos[e]*20,btpos[f]*ws[b]))
-                        paramt =(0.1/0.124998728438125)*(ls[a]+ws[b])/(16*(ls[a]*ws[b]))
+                        #paramt =(0.1/0.124998728438125)*(ls[a]+ws[b])/(16*(ls[a]*ws[b]))
+                        paramt=0.1
                         Map_Designer.make_ellipse(ls[a],ws[b]/2,p,paramt,file,theta[g])
                         env_init = Grid(20,5,file)
                         env = Map(20,5)
                         env.from_grid_to_map(env_init, 0.)
                         obstacles = env.obs_circ
 
-                        cbr = BabyRobot(start.copy(),0,1,0,1,0.1,"cr")
+                        cbr = BabyRobot(start.copy(),0,1,0,1,0.1,"cr",5.,5.,math.pi/4,-1.)
                         cr = Robot(cbr)
                         crplan = FAPF(cr.robot, cr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (1,0,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
                         cr.set_planner(crplan)
 
-                        tbr = BabyRobot(start.copy(),0,1,0,1,0.1,"tr")
+                        tbr = BabyRobot(start.copy(),0,1,0,1,0.1,"tr",5.,5.,math.pi/4,-1.)
                         tr = Robot(tbr)
                         trplan = FAPF(tr.robot, tr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (0,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
                         tr.set_planner(trplan)
 
-                        ibr = BabyRobot(start.copy(),0,1,0,1,0.1,"ir")
+                        ibr = BabyRobot(start.copy(),0,1,0,1,0.1,"ir",5.,5.,math.pi/4,-1.)
                         ir = Robot(ibr)
                         irplan = FAPF(ir.robot, ir.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (0,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
                         ir.set_planner(irplan)
 
-                        itbr = BabyRobot(start.copy(),0,1,0,1,0.1,"itr")
+                        itbr = BabyRobot(start.copy(),0,1,0,1,0.1,"itr",5.,5.,math.pi/4,-1.)
                         itr = Robot(itbr)
                         itrplan = FAPF(itr.robot, itr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 1., 2., color_trace = (1,1,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
                         itr.set_planner(itrplan)
 
-                        dcbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dc")
+                        dcbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dc",5.,5.,math.pi/4,-1.)
                         dcr = Robot(dcbr)
                         dcrplan = FDAPF(dcr.robot, dcr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (0,1,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
                         dcr.set_planner(dcrplan)
 
-                        dtbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dt")
+                        dtbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dt",5.,5.,math.pi/4,-1.)
                         dtr = Robot(dtbr)
                         dtrplan = FDAPF(dtr.robot, dtr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (1,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
                         dtr.set_planner(dtrplan)
 
-                        dibr = BabyRobot(start.copy(),0,1,0,1,0.1,"di")
+                        dibr = BabyRobot(start.copy(),0,1,0,1,0.1,"di",5.,5.,math.pi/4,-1.)
                         dir = Robot(dibr)
                         dirplan = FDAPF(dir.robot, dir.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (1,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
                         dir.set_planner(dirplan)
 
-                        ditbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dit")
+                        ditbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dit",5.,5.,math.pi/4,-1.)
                         ditr = Robot(ditbr)
                         ditrplan = FDAPF(ditr.robot, ditr.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 1., 4., 0.2, 1., 2., 4., color_trace = (0.3,0.3,0.3), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
                         ditr.set_planner(ditrplan)
 
-                        sc = Simulator(env,t_step,t_lim,prec)
+                        #dwabr = BabyRobot(start.copy(),0,1,0,1,0.1,"dwar",5.,5.,math.pi/4,-1.)
+                        #dwar = Robot(dwabr)
+                        #dwarplan = DWA(dwar.robot, dwar.robot.pos.copy(), goal.copy(), env, obstacles.copy(), 0.2, 0.4, 0.2, 0.4, 1., 0.1, 0.1, color_trace = (1,0,0), lookahead_dist = 4.)
+                        #dwar.set_planner(dwarplan)
+
+                        sc = Simulator(env,t_step,t_lim,prec,ploting=False)
                         sc.add_agent(cr)
                         sc.run2(cr)
                         sc.compute_data()
@@ -3540,7 +4620,7 @@ def main9():
                                     + ';' + str(cr.max_angle) + ';' + str(cr.time_to_reach_goal) + ';' + str(cr.planner.comp_time) + ';' + str(cr.planner.nb_collision[0]) + '\n')
                         fc.close()
 
-                        st = Simulator(env,t_step,t_lim,prec)
+                        st = Simulator(env,t_step,t_lim,prec,ploting=False)
                         st.add_agent(tr)
                         st.run2(tr)
                         st.compute_data()
@@ -3549,7 +4629,7 @@ def main9():
                                     + ';' + str(tr.max_angle) + ';' + str(tr.time_to_reach_goal) + ';' + str(tr.planner.comp_time) + ';' + str(tr.planner.nb_collision[0]) + '\n')
                         ft.close()
 
-                        si = Simulator(env,t_step,t_lim,prec)
+                        si = Simulator(env,t_step,t_lim,prec,ploting=False)
                         si.add_agent(ir)
                         si.run2(ir)
                         si.compute_data()
@@ -3558,7 +4638,7 @@ def main9():
                                     + ';' + str(ir.max_angle) + ';' + str(ir.time_to_reach_goal) + ';' + str(ir.planner.comp_time) + ';' + str(ir.planner.nb_collision[0]) + '\n')
                         fi.close()
 
-                        sit = Simulator(env,t_step,t_lim,prec)
+                        sit = Simulator(env,t_step,t_lim,prec,ploting=False)
                         sit.add_agent(itr)
                         sit.run2(itr)
                         sit.compute_data()
@@ -3567,7 +4647,7 @@ def main9():
                                     + ';' + str(itr.max_angle) + ';' + str(itr.time_to_reach_goal) + ';' + str(itr.planner.comp_time) + ';' + str(itr.planner.nb_collision[0]) + '\n')
                         fit.close()
 
-                        sdc = Simulator(env,t_step,t_lim,prec)
+                        sdc = Simulator(env,t_step,t_lim,prec,ploting=False)
                         sdc.add_agent(dcr)
                         sdc.run2(dcr)
                         sdc.compute_data()
@@ -3576,7 +4656,7 @@ def main9():
                                     + ';' + str(dcr.max_angle) + ';' + str(dcr.time_to_reach_goal) + ';' + str(dcr.planner.comp_time) + ';' + str(dcr.planner.nb_collision[0]) + '\n')
                         fdc.close()
 
-                        sdt = Simulator(env,t_step,t_lim,prec)
+                        sdt = Simulator(env,t_step,t_lim,prec,ploting=False)
                         sdt.add_agent(dtr)
                         sdt.run2(dtr)
                         sdt.compute_data()
@@ -3585,7 +4665,7 @@ def main9():
                                     + ';' + str(dtr.max_angle) + ';' + str(dtr.time_to_reach_goal) + ';' + str(dtr.planner.comp_time) + ';' + str(dtr.planner.nb_collision[0]) + '\n')
                         fdt.close()
 
-                        sdi = Simulator(env,t_step,t_lim,prec)
+                        sdi = Simulator(env,t_step,t_lim,prec,ploting=False)
                         sdi.add_agent(dir)
                         sdi.run2(dir)
                         sdi.compute_data()
@@ -3594,7 +4674,7 @@ def main9():
                                     + ';' + str(dir.max_angle) + ';' + str(dir.time_to_reach_goal) + ';' + str(dir.planner.comp_time) + ';' + str(dir.planner.nb_collision[0]) + '\n')
                         fdi.close()
 
-                        sdit = Simulator(env,t_step,t_lim,prec)
+                        sdit = Simulator(env,t_step,t_lim,prec,ploting=False)
                         sdit.add_agent(ditr)
                         sdit.run2(ditr)
                         sdit.compute_data()
@@ -3603,7 +4683,253 @@ def main9():
                                     + ';' + str(ditr.max_angle) + ';' + str(ditr.time_to_reach_goal) + ';' + str(ditr.planner.comp_time) + ';' + str(ditr.planner.nb_collision[0]) + '\n')
                         fdit.close()
 
+                        #sdwa = Simulator(env,t_step,t_lim,prec,ploting=False)
+                        #sdwa.add_agent(dwar)
+                        #sdwa.run2(dwar)
+                        #sdwa.compute_data()
+                        #fdwa = open(filedwa, 'a', encoding = "utf-8")
+                        #fdwa.write(str(file) + ';' + str(dwar.path_length) + ';' + str(dwar.sum_angle[0]) + ';' + str(dwar.sum_angle[1]) + ';' + str(dwar.sum_angle[2]) 
+                        #            + ';' + str(dwar.max_angle) + ';' + str(dwar.time_to_reach_goal) + ';' + str(dwar.planner.comp_time) + ';' + str(dwar.planner.nb_collision[0]) + '\n')
+                        #fdwa.close()
+
                         test += 1
 
+def main10():
+    """
+    random dynamic benchmark, commented part are used to run it on multiple CPU.
+    """
+    filec = "tests/benchmarkd/dynac.txt"
+    fc = open(filec, 'w', encoding = "utf-8")
+    fc.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    fc.close()
+
+    #filet = "tests/benchmarkd/dynat.txt"
+    #ft = open(filet, 'w', encoding = "utf-8")
+    #ft.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #ft.close()
+
+    #filei = "tests/benchmarkd/dynai.txt"
+    #fi = open(filei, 'w', encoding = "utf-8")
+    #fi.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fi.close()
+
+    #fileit = "tests/benchmarkd/dynait.txt"
+    #fit = open(fileit, 'w', encoding = "utf-8")
+    #fit.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fit.close()
+
+    #filedc = "tests/benchmarkd/dynadc.txt"
+    #fdc = open(filedc, 'w', encoding = "utf-8")
+    #fdc.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdc.close()
+
+    #filedt = "tests/benchmarkd/dynadt.txt"
+    #fdt = open(filedt, 'w', encoding = "utf-8")
+    #fdt.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdt.close()
+
+    #filedi = "tests/benchmarkd/dynadi.txt"
+    #fdi = open(filedi, 'w', encoding = "utf-8")
+    #fdi.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdi.close()
+
+    #filedit = "tests/benchmarkd/dynadit.txt"
+    #fdit = open(filedit, 'w', encoding = "utf-8")
+    #fdit.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdit.close()
+
+    #filedwa = "tests/benchmarkd/dynadwa.txt"
+    #fdwa = open(filedwa, 'w', encoding = "utf-8")
+    #fdwa.write("name;path length;sum angles tot;sum angles left;sum angles right;max angle;time to reach the goal;computation time;number of collisions\n")
+    #fdwa.close()
+    
+    start = np.array((2.,1.))
+    goal = np.array((18.,9.))
+    prec = 0.1
+    t_lim = 60
+    t_step = 0.1
+
+    for j in range(1000):
+        rnggen = np.random.RandomState(j)
+        rngsim = np.random.RandomState(j)
+        file = "tests/benchmarkd/"
+        file = file + "dyna" + f"{j:08}" + ".txt"
+        print(file)
+        file_split = file.split('.')
+        
+        x = 20
+        y = 10
+        Grid.write_random_env(file,x,y,80,rnggen)
+        env_init = Grid(x,y,file)
+        env = Map(20,5)
+        env.from_grid_to_map(env_init, 0.)
+        obs = env.obs_circ
+        
+
+        random_robots_list = []
+        random_agents_list = []
+        random_planner_list = []
+        apf_robots_list = []
+        apf_agents_list = []
+        apf_planner_list = []
+        #generate starting and ending points for moving obstacles
+        starts_ends = rnggen.random_sample((40,2))
+        for i in range(40):
+            starts_ends[i][0] = x*starts_ends[i][0]
+            starts_ends[i][1] = y*starts_ends[i][1]
+        obstacles = env.obs_circ.copy()
+        simulator = Simulator(env,t_step,t_lim,prec,ploting=False)
+        for i in range(0,10):
+            BabyRobot(start.copy(),0,1,0,1,0.1,"cr",5.,5.,math.pi/4,-1.)
+            random_robots_list.append(BabyRobot(starts_ends[i].copy(),0,0,0,1,0.1,"r"+str(i),5.,5.,math.pi,-1,10*math.pi))#useless params after name
+            random_agents_list.append(Robot(random_robots_list[i]))
+            random_planner_list.append(InputPlanner(random_agents_list[i].robot,starts_ends[i].copy(),starts_ends[i+20].copy(),env,obs.copy(),0,0,acts_on_speed=True, rng=rngsim))
+            random_agents_list[i].set_planner(random_planner_list[i])
+            obstacles.append(random_robots_list[i])
+            simulator.add_agent(random_agents_list[i])
+        for i in range(10,20):
+            apf_robots_list.append(BabyRobot(starts_ends[i].copy(),0,0,0,1,0.1,"a"+str(i-10),5.,5.,math.pi/4,-1.))
+            apf_agents_list.append(Robot(apf_robots_list[i-10]))
+            apf_planner_list.append(FAPF(apf_agents_list[i-10].robot, starts_ends[i].copy(), starts_ends[i+20].copy(), env, obs.copy(), 1., 1., 2., color_trace = (1,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi))
+            apf_agents_list[i-10].set_planner(apf_planner_list[i-10])
+            obstacles.append(apf_robots_list[i-10])
+            simulator.add_agent(apf_agents_list[i-10])
+        #all agents avoid other agents but not themselves (and not the observed robot)
+        for i in range(10):
+            obsi=obstacles.copy()
+            obsi.remove(apf_robots_list[i])
+            apf_planner_list[i].update_obstacles(obsi.copy())
+        
+        #the observed robot
+
+        cbr = BabyRobot(start.copy(),0,1,0,1,0.1,"cr",5.,5.,math.pi/4,-1.)
+        cr = Robot(cbr)
+        crplan = FAPF(cr.robot, cr.robot.pos.copy(), goal.copy(), env, obstacles, 1., 1., 2., color_trace = (1,0,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+        cr.set_planner(crplan)
+        sc=simulator
+        #sc = Simulator(env,t_step,t_lim,prec,ploting=False)
+        sc.add_agent(cr)
+        sc.run2(cr)
+        sc.compute_data()
+        fc = open(filec, 'a', encoding = "utf-8")
+        fc.write(str(file) + ';' + str(cr.path_length) + ';' + str(cr.sum_angle[0]) + ';' + str(cr.sum_angle[1]) + ';' + str(cr.sum_angle[2]) 
+                 + ';' + str(cr.max_angle) + ';' + str(cr.time_to_reach_goal) + ';' + str(cr.planner.comp_time) + ';' + str(cr.planner.nb_collision[0]) + '\n')
+        fc.close()
+
+        #tbr = BabyRobot(start.copy(),0,1,0,1,0.1,"tr",5.,5.,math.pi/4,-1.)
+        #tr = Robot(tbr)
+        #trplan = FAPF(tr.robot, tr.robot.pos.copy(), goal.copy(), env, obstacles, 1., 1., 2., color_trace = (0,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+        #tr.set_planner(trplan)
+        #st=simulator
+        ##st = Simulator(env,t_step,t_lim,prec,ploting=False)
+        #st.add_agent(tr)
+        #st.run2(tr)
+        #st.compute_data()
+        #ft = open(filet, 'a', encoding = "utf-8")
+        #ft.write(str(file) + ';' + str(tr.path_length) + ';' + str(tr.sum_angle[0]) + ';' + str(tr.sum_angle[1]) + ';' + str(tr.sum_angle[2]) 
+        #         + ';' + str(tr.max_angle) + ';' + str(tr.time_to_reach_goal) + ';' + str(tr.planner.comp_time) + ';' + str(tr.planner.nb_collision[0]) + '\n')
+        #ft.close()
+
+        #ibr = BabyRobot(start.copy(),0,1,0,1,0.1,"ir",5.,5.,math.pi/4,-1.)
+        #ir = Robot(ibr)
+        #irplan = FAPF(ir.robot, ir.robot.pos.copy(), goal.copy(), env, obstacles, 1., 1., 2., color_trace = (0,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+        #ir.set_planner(irplan)
+        #si=simulator
+        ##si = Simulator(env,t_step,t_lim,prec,ploting=False)
+        #si.add_agent(ir)
+        #si.run2(ir)
+        #si.compute_data()
+        #fi = open(filei, 'a', encoding = "utf-8")
+        #fi.write(str(file) + ';' + str(ir.path_length) + ';' + str(ir.sum_angle[0]) + ';' + str(ir.sum_angle[1]) + ';' + str(ir.sum_angle[2]) 
+        #         + ';' + str(ir.max_angle) + ';' + str(ir.time_to_reach_goal) + ';' + str(ir.planner.comp_time) + ';' + str(ir.planner.nb_collision[0]) + '\n')
+        #fi.close()
+
+        #itbr = BabyRobot(start.copy(),0,1,0,1,0.1,"itr",5.,5.,math.pi/4,-1.)
+        #itr = Robot(itbr)
+        #itrplan = FAPF(itr.robot, itr.robot.pos.copy(), goal.copy(), env, obstacles, 1., 1., 2., color_trace = (1,1,1), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+        #itr.set_planner(itrplan)
+        #sit=simulator
+        ##sit = Simulator(env,t_step,t_lim,prec,ploting=False)
+        #sit.add_agent(itr)
+        #sit.run2(itr)
+        #sit.compute_data()
+        #fit = open(fileit, 'a', encoding = "utf-8")
+        #fit.write(str(file) + ';' + str(itr.path_length) + ';' + str(itr.sum_angle[0]) + ';' + str(itr.sum_angle[1]) + ';' + str(itr.sum_angle[2]) 
+        #         + ';' + str(itr.max_angle) + ';' + str(itr.time_to_reach_goal) + ';' + str(itr.planner.comp_time) + ';' + str(itr.planner.nb_collision[0]) + '\n')
+        #fit.close()
+
+        #dcbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dc",5.,5.,math.pi/4,-1.)
+        #dcr = Robot(dcbr)
+        #dcrplan = FDAPF(dcr.robot, dcr.robot.pos.copy(), goal.copy(), env, obstacles, 1., 4., 0.2, 1., 2., 4., color_trace = (0,1,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+        #dcr.set_planner(dcrplan)
+        #sdc=simulator
+        ##sdc = Simulator(env,t_step,t_lim,prec,ploting=False)
+        #sdc.add_agent(dcr)
+        #sdc.run2(dcr)
+        #sdc.compute_data()
+        #fdc = open(filedc, 'a', encoding = "utf-8")
+        #fdc.write(str(file) + ';' + str(dcr.path_length) + ';' + str(dcr.sum_angle[0]) + ';' + str(dcr.sum_angle[1]) + ';' + str(dcr.sum_angle[2]) 
+        #         + ';' + str(dcr.max_angle) + ';' + str(dcr.time_to_reach_goal) + ';' + str(dcr.planner.comp_time) + ';' + str(dcr.planner.nb_collision[0]) + '\n')
+        #fdc.close()
+
+        #dtbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dt",5.,5.,math.pi/4,-1.)
+        #dtr = Robot(dtbr)
+        #dtrplan = FDAPF(dtr.robot, dtr.robot.pos.copy(), goal.copy(), env, obstacles, 1., 4., 0.2, 1., 2., 4., color_trace = (1,0,1), linear_repulsion = False, lookahead_dist = 4., inertia = False, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+        #dtr.set_planner(dtrplan)
+        #sdt=simulator
+        ##sdt = Simulator(env,t_step,t_lim,prec,ploting=False)
+        #sdt.add_agent(dtr)
+        #sdt.run2(dtr)
+        #sdt.compute_data()
+        #fdt = open(filedt, 'a', encoding = "utf-8")
+        #fdt.write(str(file) + ';' + str(dtr.path_length) + ';' + str(dtr.sum_angle[0]) + ';' + str(dtr.sum_angle[1]) + ';' + str(dtr.sum_angle[2]) 
+        #         + ';' + str(dtr.max_angle) + ';' + str(dtr.time_to_reach_goal) + ';' + str(dtr.planner.comp_time) + ';' + str(dtr.planner.nb_collision[0]) + '\n')
+        #fdt.close()
+
+        #dibr = BabyRobot(start.copy(),0,1,0,1,0.1,"di",5.,5.,math.pi/4,-1.)
+        #dir = Robot(dibr)
+        #dirplan = FDAPF(dir.robot, dir.robot.pos.copy(), goal.copy(), env, obstacles, 1., 4., 0.2, 1., 2., 4., color_trace = (1,1,0), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = False, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+        #dir.set_planner(dirplan)
+        #sdi=simulator
+        ##sdi = Simulator(env,t_step,t_lim,prec,ploting=False)
+        #sdi.add_agent(dir)
+        #sdi.run2(dir)
+        #sdi.compute_data()
+        #fdi = open(filedi, 'a', encoding = "utf-8")
+        #fdi.write(str(file) + ';' + str(dir.path_length) + ';' + str(dir.sum_angle[0]) + ';' + str(dir.sum_angle[1]) + ';' + str(dir.sum_angle[2]) 
+        #         + ';' + str(dir.max_angle) + ';' + str(dir.time_to_reach_goal) + ';' + str(dir.planner.comp_time) + ';' + str(dir.planner.nb_collision[0]) + '\n')
+        #fdi.close()
+
+        #ditbr = BabyRobot(start.copy(),0,1,0,1,0.1,"dit",5.,5.,math.pi/4,-1.)
+        #ditr = Robot(ditbr)
+        #ditrplan = FDAPF(ditr.robot, ditr.robot.pos.copy(), goal.copy(), env, obstacles, 1., 4., 0.2, 1., 2., 4., color_trace = (0.3,0.3,0.3), linear_repulsion = False, lookahead_dist = 4., inertia = True, tangential = True, attr_look = True, acts_on_speed = True, angle_detection = math.pi)
+        #ditr.set_planner(ditrplan)
+        #sdit=simulator
+        ##sdit = Simulator(env,t_step,t_lim,prec,ploting=False)
+        #sdit.add_agent(ditr)
+        #sdit.run2(ditr)
+        #sdit.compute_data()
+        #fdit = open(filedit, 'a', encoding = "utf-8")
+        #fdit.write(str(file) + ';' + str(ditr.path_length) + ';' + str(ditr.sum_angle[0]) + ';' + str(ditr.sum_angle[1]) + ';' + str(ditr.sum_angle[2]) 
+        #         + ';' + str(ditr.max_angle) + ';' + str(ditr.time_to_reach_goal) + ';' + str(ditr.planner.comp_time) + ';' + str(ditr.planner.nb_collision[0]) + '\n')
+        #fdit.close()
+
+        #dwabr = BabyRobot(start.copy(),0,1,0,1,0.1,"dwar",5.,5.,math.pi/4,-1.)
+        #dwar = Robot(dwabr)
+        #dwarplan = DWA(dwar.robot, dwar.robot.pos.copy(), goal.copy(), env, obstacles, 0.2, 0.4, 0.2, 0.4, 1., 0.1, 0.1, color_trace = (1,0,0), lookahead_dist = 4.)
+        #dwar.set_planner(dwarplan)
+        #sdwa=simulator
+        ##sdwa = Simulator(env,t_step,t_lim,prec,ploting=False)
+        #sdwa.add_agent(dwar)
+        #sdwa.run2(dwar)
+        #sdwa.compute_data()
+        #fdwa = open(filedwa, 'a', encoding = "utf-8")
+        #fdwa.write(str(file) + ';' + str(dwar.path_length) + ';' + str(dwar.sum_angle[0]) + ';' + str(dwar.sum_angle[1]) + ';' + str(dwar.sum_angle[2]) 
+        #            + ';' + str(dwar.max_angle) + ';' + str(dwar.time_to_reach_goal) + ';' + str(dwar.planner.comp_time) + ';' + str(dwar.planner.nb_collision[0]) + '\n')
+        #fdwa.close()
+
 if __name__ == '__main__':
-    main()
+    main9()
+    #cProfile.run('main()','profile.txt','cumulative')
+    #p = pstats.Stats('profile.txt').sort_stats(pstats.SortKey.TIME)
+    #p.print_stats()
